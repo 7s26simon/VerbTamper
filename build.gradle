@@ -1,0 +1,19 @@
+plugins {
+    id 'java'
+}
+
+group = 'verbTamper'
+version = '1.0'
+
+dependencies {
+    compileOnly fileTree(dir: 'libs', include: ['montoya-api-real.jar'])
+}
+
+jar {
+    manifest {
+        attributes(
+            'Burp-Extension-Class': 'verbTamper.VerbTamper'
+        )
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
