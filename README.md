@@ -40,7 +40,7 @@ Send any request to VerbTamper, select a different HTTP method from the dropdown
 
 ### Steps
 
-1. Download `VerbTamper-1.0.jar` from [Releases](../../releases)
+1. Download `VerbTamper-1.2.jar` from [Releases](../../releases)
 2. In Burp Suite, go to **Extensions → Installed → Add**
 3. Set **Extension type** to `Java`
 4. Select the downloaded `.jar` file
