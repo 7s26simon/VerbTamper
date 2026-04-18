@@ -20,8 +20,15 @@ Send any request to VerbTamper, select a different HTTP method from the dropdown
 - **Right-click context menu** — "Send to Verb Tamper" from Proxy history, Repeater, or anywhere else in Burp
 - **Dedicated tab** — request loads into an editable panel; change the verb, tweak the path, hit Send
 - **Live verb sync** — changing the dropdown rewrites the method in the request text in real time
-- **Response viewer** — raw response displayed inline with status line summary
+- **Scan All Verbs** — fires all 7 verbs in parallel and shows a colour-coded results table (status, length, preview)
+- **Diff view** — line-by-line diff of the last two responses, red for removed, green for added
+- **Auth token manager** — save labelled JWTs and apply them to the current request in one click
+- **Back / Forward navigation** — browse your send history like Repeater
+- **Copy Req / Copy Resp** — one-click clipboard copy
+- **Clear** — wipe the panel back to blank state
 - **Send to Repeater** — push the modified request to Repeater for further testing
+- **HTTP/2 aware** — automatically detects and sends HTTP/2 requests correctly
+- **Header sanitisation** — strips newlines that can sneak into header values when pasting long JWTs
 
 ---
 
@@ -52,6 +59,23 @@ Send any request to VerbTamper, select a different HTTP method from the dropdown
 4. Select a verb from the dropdown (GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD)
 5. Edit the path or headers if needed
 6. Click **Send**
+
+### Auth token manager
+
+1. Click **Add** in the Auth Tokens panel on the right
+2. Enter a label (e.g. "admin", "hacker") and paste the full JWT
+3. Select a saved token and click **Apply** to swap it into the Authorization header
+
+### Scan All Verbs
+
+1. Load a request into the panel
+2. Click **Scan All Verbs**
+3. A results table opens showing each verb's status code, response length, and body preview
+4. Rows are colour-coded: green = 2xx, yellow = 3xx, red = 4xx/5xx
+
+### Diff
+
+After sending two or more requests, click **Diff** to open a line-by-line comparison of the last two responses.
 
 ### Workflow example
 
@@ -86,7 +110,16 @@ with zipfile.ZipFile('/path/to/burpsuite.jar') as z:
         if f.startswith('burp/api/'):
             z.extract(f, '.')
 "
-zip -r libs/montoya-api-real.jar burp/
+
+# Package into a jar
+python3 -c "
+import zipfile, os
+with zipfile.ZipFile('libs/montoya-api-real.jar', 'w') as z:
+    for root, dirs, files in os.walk('burp/'):
+        for f in files:
+            path = os.path.join(root, f)
+            z.write(path)
+"
 
 # Build
 gradle jar
@@ -95,12 +128,6 @@ gradle jar
 ```
 
 > **Why not Maven Central?** The Montoya API jar on Maven Central may not match the exact version bundled with your Burp installation, causing `NoSuchMethodError` at runtime. Extracting directly from your Burp jar guarantees compatibility.
-
----
-
-## Detection notes
-
-This extension sends real HTTP requests through Burp's engine, so they will appear in Proxy history and respect any upstream proxy or session handling rules you have configured.
 
 ---
 
