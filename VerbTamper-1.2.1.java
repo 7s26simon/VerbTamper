@@ -39,7 +39,7 @@ public class VerbTamper implements BurpExtension {
         this.mainPanel = new VerbTamperPanel();
         api.userInterface().registerContextMenuItemsProvider(new VerbContextMenuProvider());
         this.tabRegistration = api.userInterface().registerSuiteTab("Verb Tamper", mainPanel);
-        api.logging().logToOutput("Verb Tamper 1.2.1-e loaded.");
+        api.logging().logToOutput("Verb Tamper 1.2.1-f loaded.");
     }
 
     private void highlightProxyItem(HttpRequest req) {
@@ -260,6 +260,25 @@ public class VerbTamper implements BurpExtension {
                 if (!text.isEmpty()) copyToClipboard(text);
             });
             diffBtn.addActionListener(e -> showDiff(lastResponse, currentResponse));
+
+            // Repeater button reads the CURRENT textarea and dropdown state on
+            // every click, so that changing the verb after a send (but before
+            // clicking Repeater) correctly pushes the intended request to
+            // Repeater rather than whatever was last sent.
+            repeaterBtn.addActionListener(e -> {
+                if (currentService == null) return;
+                String rawText = sanitiseHeaders(requestArea.getText());
+                String verb = (String) verbCombo.getSelectedItem();
+                String updatedRaw = swapMethod(rawText, verb);
+                try {
+                    HttpRequest req = HttpRequest.httpRequest(currentService, updatedRaw);
+                    api.repeater().sendToRepeater(req, "Verb Tamper - " + verb);
+                    statusLabel.setText("Sent " + verb + " to Repeater");
+                } catch (Exception ex) {
+                    api.logging().logToError("[VerbTamper] Repeater send failure: " + ex);
+                    statusLabel.setText("Repeater send failed: " + ex.getMessage());
+                }
+            });
         }
 
         private JSeparator makeSep() {
@@ -391,7 +410,7 @@ public class VerbTamper implements BurpExtension {
             statusLabel.setText("Loaded \u2014 " + (currentService != null ? currentService.host() : "unknown"));
             sendBtn.setEnabled(true);
             scanBtn.setEnabled(true);
-            repeaterBtn.setEnabled(false);
+            repeaterBtn.setEnabled(true);
             copyRespBtn.setEnabled(false);
         }
 
@@ -503,12 +522,6 @@ public class VerbTamper implements BurpExtension {
                         statusLabel.setText(selectedVerb + " \u2192 " + statusLine);
                         copyRespBtn.setEnabled(true);
                         repeaterBtn.setEnabled(true);
-
-                        for (ActionListener l : repeaterBtn.getActionListeners()) {
-                            repeaterBtn.removeActionListener(l);
-                        }
-                        repeaterBtn.addActionListener(ev ->
-                                api.repeater().sendToRepeater(finalRequest, "Verb Tamper - " + selectedVerb));
                         updateNavButtons();
                     });
                 } catch (Exception ex) {
