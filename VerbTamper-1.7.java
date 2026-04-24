@@ -30,6 +30,15 @@ public class VerbTamper implements BurpExtension {
     private MontoyaApi api;
     private static final String[] VERBS = {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"};
 
+    /** Sentinel item shown last in the verb dropdown. Picking it triggers a prompt
+     *  for a non-standard / custom verb (e.g. POSTX, PROPFIND, FOOBAR) which then
+     *  replaces this sentinel as the selected dropdown item. The scan-all-verbs
+     *  loop deliberately does NOT include the custom verb -- the scan is "try the
+     *  7 real verbs and see what shakes loose", and adding arbitrary custom verbs
+     *  to it changes what the scan means.
+     */
+    private static final String CUSTOM_VERB_LABEL = "Custom\u2026";
+
     /**
      * Catalog of bypass headers to expose in the header dropdown. Each entry
      * knows: the human-readable label, the header name, a default value, and
@@ -93,7 +102,7 @@ public class VerbTamper implements BurpExtension {
 
         api.userInterface().registerContextMenuItemsProvider(new VerbContextMenuProvider());
         this.tabRegistration = api.userInterface().registerSuiteTab("Verb Tamper", tabs);
-        api.logging().logToOutput("Verb Tamper 1.4.4 loaded.");
+        api.logging().logToOutput("Verb Tamper 1.7 loaded.");
     }
 
     private void highlightProxyItem(HttpRequest req) {
@@ -184,7 +193,7 @@ public class VerbTamper implements BurpExtension {
         exportBtn.addActionListener(e -> exportScanToCsv(session));
 
         final JLabel scanStatus = new JLabel(live
-                ? "Scanning 0 / " + VERBS.length + "..."
+                ? "Scanning 0 / " + session.expectedCount + "..."
                 : "Replay \u2014 " + session.records.size() + " results");
         scanStatus.setBorder(new EmptyBorder(4, 8, 4, 8));
 
@@ -221,8 +230,8 @@ public class VerbTamper implements BurpExtension {
         if (live) {
             model.addTableModelListener(e -> {
                 int n = model.getRowCount();
-                scanStatus.setText(n < VERBS.length
-                        ? "Scanning " + n + " / " + VERBS.length + "..."
+                scanStatus.setText(n < session.expectedCount
+                        ? "Scanning " + n + " / " + session.expectedCount + "..."
                         : "Done \u2014 click any row to see the full response");
             });
         }
@@ -380,13 +389,18 @@ public class VerbTamper implements BurpExtension {
         final String host;
         final String path;
         final String originalVerb;
+        // Total number of verbs the scan will attempt -- tracked separately
+        // from records.size() so the live progress label can show "N of M"
+        // before all the workers have completed.
+        final int expectedCount;
         final List<ScanRecord> records = new ArrayList<>();
 
-        ScanSession(String host, String path, String originalVerb) {
+        ScanSession(String host, String path, String originalVerb, int expectedCount) {
             this.timestampMs = System.currentTimeMillis();
             this.host = host;
             this.path = path;
             this.originalVerb = originalVerb;
+            this.expectedCount = expectedCount;
         }
 
         String displayTitle() {
@@ -792,8 +806,7 @@ public class VerbTamper implements BurpExtension {
 
         private final JTextArea requestArea;
         private final JTextArea responseArea;
-        private final JComboBox<String> verbCombo;
-        private final JButton sendBtn;
+        private final JComboBox<String> verbCombo;        private final JButton sendBtn;
         private final JButton scanBtn;
         private final JButton repeaterBtn;
         private final JButton backBtn;
@@ -802,6 +815,7 @@ public class VerbTamper implements BurpExtension {
         private final JButton copyReqBtn;
         private final JButton copyRespBtn;
         private final JButton diffBtn;
+        private final JButton followRedirectBtn;
         private final JLabel statusLabel;
         private final JLabel historyLabel;
 
@@ -810,6 +824,9 @@ public class VerbTamper implements BurpExtension {
 
         private HttpService currentService = null;
         private boolean loading = false;
+        // Tracks the previous selection so we can revert if the user picks
+        // "Custom..." and then cancels the prompt dialog.
+        private int lastSelectedVerbIndex = 0;
         private final List<HistoryEntry> history = new ArrayList<>();
         private int historyIndex = -1;
         private boolean navigating = false;
@@ -828,6 +845,7 @@ public class VerbTamper implements BurpExtension {
             requestArea.setLineWrap(false);
             requestArea.setText("Right-click any request in Burp and choose \"Send to Verb Tamper\"");
             requestArea.setForeground(Color.GRAY);
+            attachUrlContextMenu(requestArea, false);
             JScrollPane reqScroll = new JScrollPane(requestArea);
             reqScroll.setBorder(BorderFactory.createTitledBorder("Request (editable)"));
 
@@ -836,6 +854,7 @@ public class VerbTamper implements BurpExtension {
             responseArea.setEditable(false);
             responseArea.setBackground(new Color(28, 28, 28));
             responseArea.setForeground(new Color(180, 255, 180));
+            attachUrlContextMenu(responseArea, true);
             JScrollPane respScroll = new JScrollPane(responseArea);
             respScroll.setBorder(BorderFactory.createTitledBorder("Response"));
 
@@ -878,9 +897,9 @@ public class VerbTamper implements BurpExtension {
             historyLabel.setForeground(Color.GRAY);
             historyLabel.setFont(historyLabel.getFont().deriveFont(11.0f));
 
-            verbCombo = new JComboBox<>(VERBS);
+            verbCombo = new JComboBox<>(buildInitialVerbItems());
             verbCombo.setFont(verbCombo.getFont().deriveFont(Font.BOLD));
-            verbCombo.setPreferredSize(new Dimension(100, 28));
+            verbCombo.setPreferredSize(new Dimension(120, 28));
 
             sendBtn = new JButton("Send");
             sendBtn.setBackground(new Color(60, 130, 60));
@@ -904,6 +923,10 @@ public class VerbTamper implements BurpExtension {
             diffBtn.setToolTipText("Diff last two responses");
             diffBtn.setEnabled(false);
 
+            followRedirectBtn = new JButton("Follow Redirect");
+            followRedirectBtn.setToolTipText("Send a GET to the Location header of the current 3xx response");
+            followRedirectBtn.setEnabled(false);
+
             copyReqBtn = new JButton("Copy Req");
             copyRespBtn = new JButton("Copy Resp");
             copyRespBtn.setEnabled(false);
@@ -923,6 +946,7 @@ public class VerbTamper implements BurpExtension {
             toolbar.add(repeaterBtn);
             toolbar.add(makeSep());
             toolbar.add(diffBtn);
+            toolbar.add(followRedirectBtn);
             toolbar.add(copyReqBtn);
             toolbar.add(copyRespBtn);
             toolbar.add(clearBtn);
@@ -969,9 +993,18 @@ public class VerbTamper implements BurpExtension {
 
             verbCombo.addActionListener(e -> {
                 if (loading || navigating) return;
+                String selected = (String) verbCombo.getSelectedItem();
+                if (selected == null) return;
+                if (CUSTOM_VERB_LABEL.equals(selected)) {
+                    // Don't update lastSelectedVerbIndex here -- the prompt helper
+                    // either commits a new selection or reverts to the previous one.
+                    handleCustomVerbPicked();
+                    return;
+                }
+                lastSelectedVerbIndex = verbCombo.getSelectedIndex();
                 String text = requestArea.getText();
                 if (text.isEmpty() || text.startsWith("Right-click")) return;
-                String updated = swapMethod(text, (String) verbCombo.getSelectedItem());
+                String updated = swapMethod(text, selected);
                 int caret = requestArea.getCaretPosition();
                 requestArea.setText(updated);
                 requestArea.setCaretPosition(Math.min(caret, updated.length()));
@@ -990,7 +1023,21 @@ public class VerbTamper implements BurpExtension {
                 repeaterBtn.setEnabled(false);
                 copyRespBtn.setEnabled(false);
                 diffBtn.setEnabled(false);
+                followRedirectBtn.setEnabled(false);
                 currentService = null;
+                // Drop any custom verbs the user added via "Custom..." so the
+                // dropdown resets to its initial state. Anything past the
+                // standard verbs that isn't the sentinel is user-entered.
+                loading = true;
+                DefaultComboBoxModel<String> model =
+                        (DefaultComboBoxModel<String>) verbCombo.getModel();
+                for (int i = model.getSize() - 1; i >= VERBS.length; i--) {
+                    String item = model.getElementAt(i);
+                    if (!CUSTOM_VERB_LABEL.equals(item)) model.removeElementAt(i);
+                }
+                verbCombo.setSelectedIndex(0);
+                lastSelectedVerbIndex = 0;
+                loading = false;
             });
             copyReqBtn.addActionListener(e -> {
                 String text = requestArea.getText();
@@ -1001,6 +1048,7 @@ public class VerbTamper implements BurpExtension {
                 if (!text.isEmpty()) copyToClipboard(text);
             });
             diffBtn.addActionListener(e -> showDiff(lastResponse, currentResponse));
+            followRedirectBtn.addActionListener(e -> doFollowRedirect());
 
             // Repeater button reads the CURRENT textarea and dropdown state on
             // every click, so that changing the verb after a send (but before
@@ -1140,9 +1188,7 @@ public class VerbTamper implements BurpExtension {
             currentService = req.httpService();
             loading = true;
             String method = req.method().toUpperCase();
-            for (int i = 0; i < VERBS.length; i++) {
-                if (VERBS[i].equals(method)) { verbCombo.setSelectedIndex(i); break; }
-            }
+            selectVerbInCombo(method);
             loading = false;
             requestArea.setForeground(UIManager.getColor("TextArea.foreground"));
             requestArea.setText(req.toString());
@@ -1253,6 +1299,7 @@ public class VerbTamper implements BurpExtension {
                         lastResponse = currentResponse;
                         currentResponse = responseText;
                         diffBtn.setEnabled(lastResponse != null);
+                        followRedirectBtn.setEnabled(isFollowableRedirect(responseText));
                         if (historyIndex < history.size() - 1) {
                             history.subList(historyIndex + 1, history.size()).clear();
                         }
@@ -1287,17 +1334,33 @@ public class VerbTamper implements BurpExtension {
             boolean isHttp2 = rawText.split("\r?\n")[0].toUpperCase().contains("HTTP/2");
             final HttpMode mode = isHttp2 ? HttpMode.HTTP_2 : HttpMode.AUTO;
 
+            // Collect verbs to scan: the seven standard verbs plus any custom
+            // verbs the user has added via the "Custom..." prompt. We read from
+            // the dropdown rather than the static VERBS array so a fresh
+            // POSTX-style entry gets included automatically. Anything matching
+            // the Custom... sentinel is skipped (it's not a real verb).
+            final List<String> verbsToScan = new ArrayList<>();
+            DefaultComboBoxModel<String> verbModel =
+                    (DefaultComboBoxModel<String>) verbCombo.getModel();
+            for (int i = 0; i < verbModel.getSize(); i++) {
+                String v = verbModel.getElementAt(i);
+                if (v == null || CUSTOM_VERB_LABEL.equals(v)) continue;
+                verbsToScan.add(v);
+            }
+            final int totalVerbs = verbsToScan.size();
+            if (totalVerbs == 0) return;
+
             // Build a session stub; workers will fill it as results arrive.
             String originalVerb = (String) verbCombo.getSelectedItem();
             String path = rawText.split("\r?\n")[0].replaceAll("^\\w+\\s", "").replaceAll("\\s.*", "");
             String host = currentService != null ? currentService.host() : "";
-            final ScanSession session = new ScanSession(host, path, originalVerb);
+            final ScanSession session = new ScanSession(host, path, originalVerb, totalVerbs);
 
             // Open the live results dialog. Rows will get appended as workers complete.
             final DefaultTableModel model = showScanResultsDialog(session, true);
 
             final AtomicInteger done = new AtomicInteger(0);
-            for (final String verb : VERBS) {
+            for (final String verb : verbsToScan) {
                 new Thread(() -> {
                     try {
                         String verbRaw = swapMethod(rawText, verb);
@@ -1339,7 +1402,7 @@ public class VerbTamper implements BurpExtension {
                             session.records.add(record);
                             model.addRow(new Object[]{record.verb, record.status, "" + record.length, record.preview});
                             int n = done.incrementAndGet();
-                            if (n >= VERBS.length) finalizeScan(session);
+                            if (n >= totalVerbs) finalizeScan(session);
                         });
                     } catch (Exception ex) {
                         final ScanRecord record = new ScanRecord(verb, "ERR", 0, ex.getMessage(), "Error: " + ex.getMessage());
@@ -1347,7 +1410,7 @@ public class VerbTamper implements BurpExtension {
                             session.records.add(record);
                             model.addRow(new Object[]{record.verb, "ERR", "-", record.preview});
                             int n = done.incrementAndGet();
-                            if (n >= VERBS.length) finalizeScan(session);
+                            if (n >= totalVerbs) finalizeScan(session);
                         });
                     }
                 }, "VerbTamper-Scan-" + verb).start();
@@ -1358,6 +1421,215 @@ public class VerbTamper implements BurpExtension {
         private void finalizeScan(ScanSession session) {
             scanHistory.add(session);
             if (historyPanel != null) historyPanel.refresh();
+        }
+
+        /** True if the response text starts with an HTTP/X 3xx status and has a
+         *  Location header. Used to gate the Follow Redirect button.
+         *  We accept 301/302/303/307/308 -- any 3xx with a Location.
+         */
+        private boolean isFollowableRedirect(String responseText) {
+            if (responseText == null || responseText.isEmpty()) return false;
+            String[] lines = responseText.split("\r?\n");
+            if (lines.length == 0) return false;
+            // First line: "HTTP/2 302 Found" -> grab the second whitespace-separated token.
+            String[] firstParts = lines[0].split("\\s+");
+            if (firstParts.length < 2) return false;
+            String code = firstParts[1];
+            if (code.length() < 3 || code.charAt(0) != '3') return false;
+            // Walk headers looking for Location: -- stop at the first blank line.
+            for (int i = 1; i < lines.length; i++) {
+                String l = lines[i];
+                if (l.isEmpty()) break;
+                if (l.toLowerCase(java.util.Locale.ROOT).startsWith("location:")) return true;
+            }
+            return false;
+        }
+
+        /** Pull the Location header value out of the response text, or null if absent. */
+        private String extractLocation(String responseText) {
+            if (responseText == null) return null;
+            String[] lines = responseText.split("\r?\n");
+            for (int i = 1; i < lines.length; i++) {
+                String l = lines[i];
+                if (l.isEmpty()) break;
+                if (l.toLowerCase(java.util.Locale.ROOT).startsWith("location:")) {
+                    return l.substring("Location:".length()).trim();
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Send a GET to the Location of the current response. Per the user's
+         * request, this is single-hop only (no chain following) and uses GET
+         * regardless of the original verb. Auth headers from the original
+         * request are preserved -- including across cross-origin redirects,
+         * because the point of the tool is to see what the redirected
+         * endpoint does with your credentials.
+         *
+         * The new response is appended to the existing response with a
+         * separator so the original 3xx stays visible.
+         */
+        private void doFollowRedirect() {
+            if (currentService == null || currentResponse == null) return;
+            final String location = extractLocation(currentResponse);
+            if (location == null) {
+                statusLabel.setText("No Location header to follow");
+                return;
+            }
+
+            // Resolve the redirect target: either an absolute https://host/path
+            // URL (which gives us a new HttpService) or a relative /path that
+            // reuses the current host/port/scheme.
+            final HttpService targetService;
+            final String targetPath;
+            if (location.startsWith("http://") || location.startsWith("https://")) {
+                try {
+                    java.net.URI uri = java.net.URI.create(location);
+                    boolean tls = "https".equalsIgnoreCase(uri.getScheme());
+                    int port = uri.getPort();
+                    if (port == -1) port = tls ? 443 : 80;
+                    targetService = HttpService.httpService(uri.getHost(), port, tls);
+                    String pathPart = uri.getRawPath() == null || uri.getRawPath().isEmpty() ? "/" : uri.getRawPath();
+                    if (uri.getRawQuery() != null) pathPart = pathPart + "?" + uri.getRawQuery();
+                    targetPath = pathPart;
+                } catch (Exception ex) {
+                    statusLabel.setText("Bad Location URL: " + ex.getMessage());
+                    api.logging().logToError("[VerbTamper] Redirect parse failed: " + ex);
+                    return;
+                }
+            } else {
+                // Relative path: reuse current service. If it doesn't start with /,
+                // resolve against the current request's path -- but in practice
+                // most servers send a leading-/ Location.
+                targetService = currentService;
+                targetPath = location.startsWith("/") ? location : "/" + location;
+            }
+
+            // Build a GET request preserving the headers from the textarea but
+            // dropping the body and any body-specific headers.
+            final String newRequest = buildGetRequestFromCurrent(targetService, targetPath);
+
+            api.logging().logToOutput("[VerbTamper] Following redirect: GET "
+                    + targetService.host() + targetPath);
+
+            sendBtn.setEnabled(false);
+            followRedirectBtn.setEnabled(false);
+            statusLabel.setText("Following redirect to " + targetPath + "...");
+
+            new Thread(() -> {
+                try {
+                    HttpRequest req = HttpRequest.httpRequest(targetService, newRequest);
+                    boolean isHttp2 = newRequest.split("\r?\n")[0].toUpperCase().contains("HTTP/2");
+                    HttpMode mode = isHttp2 ? HttpMode.HTTP_2 : HttpMode.AUTO;
+                    HttpRequestResponse result = api.http().sendRequest(req, mode);
+
+                    final String responseText;
+                    final String statusLine;
+                    if (result == null || result.response() == null) {
+                        responseText = "(no response received)";
+                        statusLine = "no response";
+                    } else {
+                        String body;
+                        try {
+                            byte[] bytes = result.response().toByteArray().getBytes();
+                            body = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                        } catch (Exception ex) {
+                            body = result.response().toString();
+                        }
+                        if (body == null || body.isEmpty()) {
+                            StringBuilder sb = new StringBuilder();
+                            sb.append(result.response().httpVersion()).append(' ')
+                              .append(result.response().statusCode()).append(' ')
+                              .append(result.response().reasonPhrase()).append("\r\n");
+                            result.response().headers().forEach(h ->
+                                sb.append(h.name()).append(": ").append(h.value()).append("\r\n"));
+                            sb.append("\r\n").append(result.response().bodyToString());
+                            body = sb.toString();
+                        }
+                        responseText = body;
+                        statusLine = body.split("\r?\n", 2)[0];
+                    }
+
+                    // Append to the current response with a clear separator.
+                    final String separator = "\r\n\r\n========== Followed redirect: GET "
+                            + targetService.host() + targetPath + " ==========\r\n\r\n";
+                    final String combined = currentResponse + separator + responseText;
+
+                    // Log this hop in send history with a [redirect] tag in the
+                    // path so it's visible-but-distinct in the history table.
+                    final HistoryEntry redirectEntry = new HistoryEntry(
+                            newRequest, "GET [redirect]", responseText, targetService);
+
+                    SwingUtilities.invokeLater(() -> {
+                        currentResponse = combined;
+                        responseArea.setText(combined);
+                        responseArea.setCaretPosition(responseArea.getDocument().getLength());
+                        statusLabel.setText("Followed redirect \u2192 " + statusLine);
+                        copyRespBtn.setEnabled(true);
+                        // Re-enable in case the new response is itself a redirect.
+                        followRedirectBtn.setEnabled(isFollowableRedirect(responseText));
+                        history.add(redirectEntry);
+                        historyIndex = history.size() - 1;
+                        updateNavButtons();
+                        if (sendHistoryPanel != null) sendHistoryPanel.refresh();
+                    });
+                } catch (Exception ex) {
+                    api.logging().logToError("[VerbTamper] Redirect send failed: " + ex);
+                    SwingUtilities.invokeLater(() -> {
+                        statusLabel.setText("Redirect send failed: " + ex.getMessage());
+                    });
+                } finally {
+                    SwingUtilities.invokeLater(() -> sendBtn.setEnabled(true));
+                }
+            }, "VerbTamper-FollowRedirect").start();
+        }
+
+        /**
+         * Builds a GET request to the given target using the headers currently
+         * in the textarea, but rewrites the request line to "GET <path>" and
+         * strips the body plus body-specific headers (Content-Type,
+         * Content-Length). The Host header is also rewritten if the target
+         * host differs from the current request's host.
+         */
+        private String buildGetRequestFromCurrent(HttpService target, String targetPath) {
+            String raw = requestArea.getText();
+            String normalised = raw.replace("\r\n", "\n").replace("\r", "\n");
+            int blank = normalised.indexOf("\n\n");
+            String headerPart = blank == -1 ? normalised : normalised.substring(0, blank);
+
+            // Preserve HTTP version from the original request line.
+            String[] lines = headerPart.split("\n", -1);
+            String version = "HTTP/2";
+            if (lines.length > 0) {
+                String[] firstParts = lines[0].split("\\s+");
+                if (firstParts.length >= 3) version = firstParts[2];
+            }
+
+            StringBuilder out = new StringBuilder();
+            out.append("GET ").append(targetPath).append(' ').append(version).append("\r\n");
+
+            // Replay all headers except the request line, Content-Type,
+            // Content-Length, and the original Host (we'll write a fresh Host).
+            boolean hostWritten = false;
+            for (int i = 1; i < lines.length; i++) {
+                String l = lines[i];
+                if (l.isEmpty()) continue;
+                String lower = l.toLowerCase(java.util.Locale.ROOT);
+                if (lower.startsWith("content-type:")) continue;
+                if (lower.startsWith("content-length:")) continue;
+                if (lower.startsWith("host:")) {
+                    out.append("Host: ").append(target.host()).append("\r\n");
+                    hostWritten = true;
+                    continue;
+                }
+                out.append(l).append("\r\n");
+            }
+            if (!hostWritten) {
+                out.append("Host: ").append(target.host()).append("\r\n");
+            }
+            out.append("\r\n");  // headers terminator, no body
+            return out.toString();
         }
 
         private void showDiff(String a, String b) {
@@ -1416,9 +1688,7 @@ public class VerbTamper implements BurpExtension {
             historyIndex = newIndex;
             HistoryEntry entry = history.get(historyIndex);
             navigating = true;
-            for (int i = 0; i < VERBS.length; i++) {
-                if (VERBS[i].equals(entry.verb)) { verbCombo.setSelectedIndex(i); break; }
-            }
+            selectVerbInCombo(entry.verb);
             requestArea.setForeground(UIManager.getColor("TextArea.foreground"));
             requestArea.setText(entry.requestText);
             requestArea.setCaretPosition(0);
@@ -1428,6 +1698,7 @@ public class VerbTamper implements BurpExtension {
             sendBtn.setEnabled(true);
             scanBtn.setEnabled(true);
             repeaterBtn.setEnabled(true);
+            followRedirectBtn.setEnabled(isFollowableRedirect(entry.responseText));
             navigating = false;
             updateNavButtons();
         }
@@ -1463,10 +1734,247 @@ public class VerbTamper implements BurpExtension {
             Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
         }
 
+        /**
+         * Build the absolute URL of the current request from the request line,
+         * the Host header, and the HttpService's TLS flag. Returns null if any
+         * piece is missing (e.g. the textarea is empty or the placeholder is
+         * still showing).
+         */
+        private String currentRequestUrl() {
+            if (currentService == null) return null;
+            String raw = requestArea.getText();
+            if (raw == null || raw.isEmpty() || raw.startsWith("Right-click")) return null;
+
+            // Path is the second whitespace-separated token on the first line.
+            String firstLine = raw.split("\r?\n", 2)[0];
+            String[] parts = firstLine.split("\\s+");
+            if (parts.length < 2) return null;
+            String path = parts[1];
+
+            // Prefer the Host header so user edits are honoured. Fall back to
+            // the HttpService's host if the user removed the header.
+            String host = currentService.host();
+            for (String line : raw.split("\r?\n")) {
+                if (line.isEmpty()) break;  // headers terminator
+                if (line.toLowerCase(java.util.Locale.ROOT).startsWith("host:")) {
+                    host = line.substring("host:".length()).trim();
+                    break;
+                }
+            }
+
+            String scheme = currentService.secure() ? "https" : "http";
+            int port = currentService.port();
+            // Only include the port if it isn't the default for the scheme.
+            boolean defaultPort = (scheme.equals("https") && port == 443)
+                    || (scheme.equals("http") && port == 80);
+            String hostPart = (host.contains(":") || defaultPort) ? host : host + ":" + port;
+            return scheme + "://" + hostPart + path;
+        }
+
+        /**
+         * Resolve the Location header of the current response into an absolute
+         * URL. Reuses the redirect-following logic so relative paths get
+         * combined with the current host. Returns null if there's no Location.
+         */
+        private String currentLocationUrl() {
+            if (currentResponse == null) return null;
+            String location = extractLocation(currentResponse);
+            if (location == null) return null;
+            if (location.startsWith("http://") || location.startsWith("https://")) {
+                return location;
+            }
+            if (currentService == null) return location;
+            String scheme = currentService.secure() ? "https" : "http";
+            int port = currentService.port();
+            boolean defaultPort = (scheme.equals("https") && port == 443)
+                    || (scheme.equals("http") && port == 80);
+            String hostPart = defaultPort ? currentService.host() : currentService.host() + ":" + port;
+            String pathPart = location.startsWith("/") ? location : "/" + location;
+            return scheme + "://" + hostPart + pathPart;
+        }
+
+        /**
+         * Attach a "Copy URL" right-click menu to a JTextArea. For the response
+         * area, also adds a "Copy Location URL" item enabled only when the
+         * current response has a Location header. Standard editor actions
+         * (Cut/Copy/Paste/Select All) are added below as a separator group so
+         * the new menu replaces, rather than competes with, the native one.
+         */
+        private void attachUrlContextMenu(JTextArea area, boolean isResponse) {
+            JPopupMenu menu = new JPopupMenu();
+
+            JMenuItem copyUrlItem = new JMenuItem("Copy URL");
+            copyUrlItem.addActionListener(e -> {
+                String url = currentRequestUrl();
+                if (url != null) {
+                    copyToClipboard(url);
+                    statusLabel.setText("Copied URL: " + url);
+                } else {
+                    statusLabel.setText("No URL to copy \u2014 load a request first");
+                }
+            });
+            menu.add(copyUrlItem);
+
+            final JMenuItem copyLocationItem;
+            if (isResponse) {
+                copyLocationItem = new JMenuItem("Copy Location URL");
+                copyLocationItem.addActionListener(e -> {
+                    String url = currentLocationUrl();
+                    if (url != null) {
+                        copyToClipboard(url);
+                        statusLabel.setText("Copied Location URL: " + url);
+                    } else {
+                        statusLabel.setText("No Location header in current response");
+                    }
+                });
+                menu.add(copyLocationItem);
+            } else {
+                copyLocationItem = null;
+            }
+
+            menu.addSeparator();
+
+            JMenuItem cut = new JMenuItem("Cut");
+            cut.addActionListener(e -> area.cut());
+            JMenuItem copy = new JMenuItem("Copy");
+            copy.addActionListener(e -> area.copy());
+            JMenuItem paste = new JMenuItem("Paste");
+            paste.addActionListener(e -> area.paste());
+            JMenuItem selectAll = new JMenuItem("Select All");
+            selectAll.addActionListener(e -> area.selectAll());
+
+            // Read-only response area: Cut and Paste don't apply.
+            if (!area.isEditable()) {
+                menu.add(copy);
+                menu.add(selectAll);
+            } else {
+                menu.add(cut);
+                menu.add(copy);
+                menu.add(paste);
+                menu.add(selectAll);
+            }
+
+            // Refresh enabled state when the menu opens, so e.g. "Copy Location
+            // URL" is greyed out when there's no Location header.
+            menu.addPopupMenuListener(new javax.swing.event.PopupMenuListener() {
+                @Override public void popupMenuWillBecomeVisible(javax.swing.event.PopupMenuEvent e) {
+                    copyUrlItem.setEnabled(currentRequestUrl() != null);
+                    if (copyLocationItem != null) {
+                        copyLocationItem.setEnabled(currentLocationUrl() != null);
+                    }
+                }
+                @Override public void popupMenuWillBecomeInvisible(javax.swing.event.PopupMenuEvent e) {}
+                @Override public void popupMenuCanceled(javax.swing.event.PopupMenuEvent e) {}
+            });
+
+            area.setComponentPopupMenu(menu);
+        }
+
+        /** Selects the given verb in the dropdown. For standard verbs this is
+         *  a simple index match. For non-standard verbs (e.g. PROPFIND from a
+         *  loaded request, or POSTX from history replay) we add the verb to
+         *  the dropdown right before the "Custom..." sentinel and select it,
+         *  so the user can see and use it like any other verb. Caller is
+         *  responsible for setting the loading flag if needed. */
+        private void selectVerbInCombo(String verb) {
+            if (verb == null) return;
+            String upper = verb.toUpperCase();
+            DefaultComboBoxModel<String> model =
+                    (DefaultComboBoxModel<String>) verbCombo.getModel();
+            // Already in the dropdown? Just select it.
+            int existing = model.getIndexOf(upper);
+            if (existing >= 0) {
+                verbCombo.setSelectedIndex(existing);
+                lastSelectedVerbIndex = existing;
+                return;
+            }
+            // Non-standard verb: add it before the Custom... sentinel and select it.
+            int sentinelIdx = model.getIndexOf(CUSTOM_VERB_LABEL);
+            if (sentinelIdx >= 0) {
+                model.insertElementAt(upper, sentinelIdx);
+                verbCombo.setSelectedItem(upper);
+            } else {
+                model.addElement(upper);
+                verbCombo.setSelectedItem(upper);
+            }
+            lastSelectedVerbIndex = verbCombo.getSelectedIndex();
+        }
+
         private String swapMethod(String raw, String newMethod) {
             int firstSpace = raw.indexOf(' ');
             if (firstSpace == -1) return raw;
             return newMethod + raw.substring(firstSpace);
+        }
+
+        /** Builds the initial list of items for the verb dropdown: the seven
+         *  standard verbs followed by the "Custom..." sentinel. */
+        private String[] buildInitialVerbItems() {
+            String[] items = new String[VERBS.length + 1];
+            System.arraycopy(VERBS, 0, items, 0, VERBS.length);
+            items[VERBS.length] = CUSTOM_VERB_LABEL;
+            return items;
+        }
+
+        /** Called when the user picks "Custom..." from the verb dropdown.
+         *  Prompts for a verb string, validates it lightly (uppercase, trim,
+         *  reject empty), and replaces the sentinel item in the dropdown
+         *  with the entered verb so it shows up as the selected option.
+         *  If the user cancels or enters nothing, reverts to the previous
+         *  selection. */
+        private void handleCustomVerbPicked() {
+            String input = (String) JOptionPane.showInputDialog(
+                    this,
+                    "Enter a custom HTTP verb (e.g. POSTX, PROPFIND, FOOBAR):",
+                    "Custom verb",
+                    JOptionPane.PLAIN_MESSAGE,
+                    null, null, "");
+            if (input == null) {
+                // User hit Cancel -- revert to previous selection.
+                loading = true;
+                verbCombo.setSelectedIndex(lastSelectedVerbIndex);
+                loading = false;
+                return;
+            }
+            String verb = input.trim().toUpperCase();
+            if (verb.isEmpty()) {
+                loading = true;
+                verbCombo.setSelectedIndex(lastSelectedVerbIndex);
+                loading = false;
+                return;
+            }
+
+            // Replace the "Custom..." sentinel with the actual entered verb,
+            // and add a fresh "Custom..." back at the end so the option is
+            // still available for next time.
+            loading = true;
+            DefaultComboBoxModel<String> model =
+                    (DefaultComboBoxModel<String>) verbCombo.getModel();
+            // Find and remove any previous custom-verb entries (anything past
+            // the standard verbs that isn't the sentinel) so the dropdown
+            // doesn't grow unboundedly across many "Custom..." picks.
+            for (int i = model.getSize() - 1; i >= VERBS.length; i--) {
+                String item = model.getElementAt(i);
+                if (!item.equals(CUSTOM_VERB_LABEL)) model.removeElementAt(i);
+            }
+            // Drop the existing sentinel, append the new verb, then re-append
+            // the sentinel so it stays at the bottom.
+            int sentinelIdx = model.getIndexOf(CUSTOM_VERB_LABEL);
+            if (sentinelIdx >= 0) model.removeElementAt(sentinelIdx);
+            model.addElement(verb);
+            model.addElement(CUSTOM_VERB_LABEL);
+            verbCombo.setSelectedItem(verb);
+            lastSelectedVerbIndex = verbCombo.getSelectedIndex();
+            loading = false;
+
+            // Apply the new verb to the request line, same as a normal pick.
+            String text = requestArea.getText();
+            if (!text.isEmpty() && !text.startsWith("Right-click")) {
+                String updated = swapMethod(text, verb);
+                int caret = requestArea.getCaretPosition();
+                requestArea.setText(updated);
+                requestArea.setCaretPosition(Math.min(caret, updated.length()));
+            }
+            statusLabel.setText("Custom verb set to " + verb);
         }
 
         /**
@@ -1543,13 +2051,8 @@ public class VerbTamper implements BurpExtension {
             // If this is a method-override header, also flip the verb dropdown.
             String extraMsg = "";
             if (h.overrideVerb != null) {
-                for (int i = 0; i < VERBS.length; i++) {
-                    if (VERBS[i].equals(h.overrideVerb)) {
-                        verbCombo.setSelectedIndex(i);
-                        extraMsg = " (verb set to " + h.overrideVerb + ")";
-                        break;
-                    }
-                }
+                selectVerbInCombo(h.overrideVerb);
+                extraMsg = " (verb set to " + h.overrideVerb + ")";
             }
             statusLabel.setText((replaced ? "Replaced " : "Added ") + h.name + extraMsg);
         }
