@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'verbTamper'
-version = '1.8'
+version = '1.8.1'
 
 dependencies {
     compileOnly fileTree(dir: 'libs', include: ['montoya-api-real.jar'])

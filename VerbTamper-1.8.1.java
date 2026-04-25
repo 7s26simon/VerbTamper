@@ -102,7 +102,7 @@ public class VerbTamper implements BurpExtension {
 
         api.userInterface().registerContextMenuItemsProvider(new VerbContextMenuProvider());
         this.tabRegistration = api.userInterface().registerSuiteTab("Verb Tamper", tabs);
-        api.logging().logToOutput("Verb Tamper 1.8 loaded.");
+        api.logging().logToOutput("Verb Tamper 1.8.1 loaded.");
     }
 
     private void highlightProxyItem(HttpRequest req) {
@@ -478,10 +478,12 @@ public class VerbTamper implements BurpExtension {
             nextBtn.addActionListener(e -> step(1));
             prevBtn.addActionListener(e -> step(-1));
 
-            // Re-run the active search whenever the textarea content changes
-            // (Send completes, history navigation, redirect appends, user
-            // edits). Only fires if there's a non-empty query active, so
-            // typing in an empty search bar costs nothing.
+            // Re-highlight matches whenever the textarea content changes (Send
+            // completes, history navigation, redirect appends, user edits).
+            // Critically, this MUST NOT move the caret -- otherwise typing
+            // into a textarea while a search is active causes each keystroke
+            // to yank the cursor back to the first match. Caret movement only
+            // happens on explicit user action (Enter, prev/next buttons).
             target.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
                 @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { onChange(); }
                 @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { onChange(); }
@@ -489,7 +491,7 @@ public class VerbTamper implements BurpExtension {
                 private void onChange() {
                     if (input.getText() == null || input.getText().isEmpty()) return;
                     // Defer to allow the document to stabilize before we re-scan.
-                    SwingUtilities.invokeLater(() -> recomputeAndJump(false));
+                    SwingUtilities.invokeLater(() -> recomputeHighlightsOnly());
                 }
             });
 
@@ -554,6 +556,49 @@ public class VerbTamper implements BurpExtension {
             currentIndex = pick;
             paintAll();
             scrollToCurrent();
+            prevBtn.setEnabled(true);
+            nextBtn.setEnabled(true);
+        }
+
+        /** Recompute matches and refresh highlights, but do NOT move the caret
+         *  or scroll. Used by the document listener so background changes (or
+         *  the user typing into the request editor) don't yank the cursor. */
+        private void recomputeHighlightsOnly() {
+            String query = input.getText();
+            if (query == null || query.isEmpty()) return;
+
+            matches.clear();
+            String haystack = target.getText();
+            String hay = haystack.toLowerCase(java.util.Locale.ROOT);
+            String needle = query.toLowerCase(java.util.Locale.ROOT);
+
+            int from = 0;
+            while (true) {
+                int idx = hay.indexOf(needle, from);
+                if (idx < 0) break;
+                matches.add(new int[]{idx, idx + needle.length()});
+                from = idx + Math.max(needle.length(), 1);
+            }
+
+            if (matches.isEmpty()) {
+                clearHighlights();
+                counter.setText("no matches");
+                counter.setForeground(new Color(180, 60, 60));
+                prevBtn.setEnabled(false);
+                nextBtn.setEnabled(false);
+                currentIndex = -1;
+                return;
+            }
+            counter.setForeground(Color.GRAY);
+
+            // Preserve the user's "current" position when possible -- if the
+            // previous current index is still within range, keep it. Otherwise
+            // clamp to the last valid index. Don't try to follow the caret;
+            // that's what causes the cursor-yanking bug.
+            if (currentIndex < 0 || currentIndex >= matches.size()) {
+                currentIndex = 0;
+            }
+            paintAll();   // updates highlights and counter; does not scroll or set caret
             prevBtn.setEnabled(true);
             nextBtn.setEnabled(true);
         }
