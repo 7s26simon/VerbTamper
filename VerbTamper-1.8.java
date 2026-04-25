@@ -102,7 +102,7 @@ public class VerbTamper implements BurpExtension {
 
         api.userInterface().registerContextMenuItemsProvider(new VerbContextMenuProvider());
         this.tabRegistration = api.userInterface().registerSuiteTab("Verb Tamper", tabs);
-        api.logging().logToOutput("Verb Tamper 1.7 loaded.");
+        api.logging().logToOutput("Verb Tamper 1.8 loaded.");
     }
 
     private void highlightProxyItem(HttpRequest req) {
@@ -405,6 +405,205 @@ public class VerbTamper implements BurpExtension {
 
         String displayTitle() {
             return host + path;
+        }
+    }
+
+    /**
+     * A reusable search bar that attaches to a JTextArea. Provides:
+     *   - a text field; pressing Enter finds the first match below the caret,
+     *     scrolls it into view, and yellow-highlights every other match
+     *   - Find Next / Find Previous buttons (wrap-around)
+     *   - a "3 / 12" counter showing current position and total matches
+     *   - Escape clears the search and removes all highlights
+     *
+     * Search is case-insensitive (almost always what you want for headers
+     * and JSON keys).
+     *
+     * The "current" match gets a stronger orange highlight; the others get
+     * pale yellow, so you can see at a glance how many hits there are and
+     * which one you're on.
+     */
+    private static class SearchBar extends JPanel {
+        private final JTextArea target;
+        private final JTextField input;
+        private final JButton prevBtn;
+        private final JButton nextBtn;
+        private final JLabel counter;
+
+        // Highlight painters: pale yellow for "all matches", orange for "this one".
+        private static final javax.swing.text.Highlighter.HighlightPainter MATCH_PAINT =
+                new javax.swing.text.DefaultHighlighter.DefaultHighlightPainter(new Color(255, 240, 130));
+        private static final javax.swing.text.Highlighter.HighlightPainter CURRENT_PAINT =
+                new javax.swing.text.DefaultHighlighter.DefaultHighlightPainter(new Color(255, 165, 0));
+
+        // The list of (start, end) match offsets in the current text, plus
+        // which one is "current". Re-computed every time the search query
+        // changes; cleared on Escape or empty query.
+        private final List<int[]> matches = new ArrayList<>();
+        private int currentIndex = -1;
+
+        SearchBar(JTextArea target, String label) {
+            super(new FlowLayout(FlowLayout.LEFT, 4, 2));
+            this.target = target;
+
+            JLabel labelComp = new JLabel(label);
+            labelComp.setFont(labelComp.getFont().deriveFont(11.0f));
+            labelComp.setForeground(Color.GRAY);
+
+            input = new JTextField(28);
+            input.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+            input.setToolTipText("Type and press Enter to search. Esc to clear.");
+
+            prevBtn = new JButton("\u25C0");
+            prevBtn.setMargin(new Insets(1, 5, 1, 5));
+            prevBtn.setToolTipText("Previous match");
+            prevBtn.setEnabled(false);
+
+            nextBtn = new JButton("\u25B6");
+            nextBtn.setMargin(new Insets(1, 5, 1, 5));
+            nextBtn.setToolTipText("Next match");
+            nextBtn.setEnabled(false);
+
+            counter = new JLabel("");
+            counter.setFont(counter.getFont().deriveFont(11.0f));
+            counter.setForeground(Color.GRAY);
+
+            add(labelComp);
+            add(input);
+            add(prevBtn);
+            add(nextBtn);
+            add(counter);
+
+            input.addActionListener(e -> recomputeAndJump(true));
+            nextBtn.addActionListener(e -> step(1));
+            prevBtn.addActionListener(e -> step(-1));
+
+            // Re-run the active search whenever the textarea content changes
+            // (Send completes, history navigation, redirect appends, user
+            // edits). Only fires if there's a non-empty query active, so
+            // typing in an empty search bar costs nothing.
+            target.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+                @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { onChange(); }
+                @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { onChange(); }
+                @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { onChange(); }
+                private void onChange() {
+                    if (input.getText() == null || input.getText().isEmpty()) return;
+                    // Defer to allow the document to stabilize before we re-scan.
+                    SwingUtilities.invokeLater(() -> recomputeAndJump(false));
+                }
+            });
+
+            // Esc clears the search.
+            input.getInputMap().put(
+                    javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ESCAPE, 0),
+                    "verbtamper-clear-search");
+            input.getActionMap().put("verbtamper-clear-search",
+                    new javax.swing.AbstractAction() {
+                        @Override public void actionPerformed(java.awt.event.ActionEvent e) {
+                            input.setText("");
+                            clearHighlights();
+                            counter.setText("");
+                            prevBtn.setEnabled(false);
+                            nextBtn.setEnabled(false);
+                        }
+                    });
+        }
+
+        /** Scan the target text for the current query, highlight every match,
+         *  and jump to the first match at or after the current caret position. */
+        private void recomputeAndJump(boolean fromUserAction) {
+            clearHighlights();
+            matches.clear();
+            currentIndex = -1;
+
+            String query = input.getText();
+            if (query == null || query.isEmpty()) {
+                counter.setText("");
+                prevBtn.setEnabled(false);
+                nextBtn.setEnabled(false);
+                return;
+            }
+
+            String haystack = target.getText();
+            String hay = haystack.toLowerCase(java.util.Locale.ROOT);
+            String needle = query.toLowerCase(java.util.Locale.ROOT);
+
+            int from = 0;
+            while (true) {
+                int idx = hay.indexOf(needle, from);
+                if (idx < 0) break;
+                matches.add(new int[]{idx, idx + needle.length()});
+                from = idx + Math.max(needle.length(), 1);
+            }
+
+            if (matches.isEmpty()) {
+                counter.setText("no matches");
+                counter.setForeground(new Color(180, 60, 60));
+                prevBtn.setEnabled(false);
+                nextBtn.setEnabled(false);
+                return;
+            }
+            counter.setForeground(Color.GRAY);
+
+            // Pick the first match at or after the caret; otherwise the first.
+            int caret = target.getCaretPosition();
+            int pick = 0;
+            for (int i = 0; i < matches.size(); i++) {
+                if (matches.get(i)[0] >= caret) { pick = i; break; }
+            }
+            currentIndex = pick;
+            paintAll();
+            scrollToCurrent();
+            prevBtn.setEnabled(true);
+            nextBtn.setEnabled(true);
+        }
+
+        /** Move to the next/previous match, wrapping at the ends. */
+        private void step(int direction) {
+            if (matches.isEmpty()) return;
+            currentIndex = (currentIndex + direction + matches.size()) % matches.size();
+            paintAll();
+            scrollToCurrent();
+        }
+
+        private void clearHighlights() {
+            target.getHighlighter().removeAllHighlights();
+        }
+
+        /** Repaints all matches: pale yellow for everything, orange for current. */
+        private void paintAll() {
+            javax.swing.text.Highlighter h = target.getHighlighter();
+            h.removeAllHighlights();
+            for (int i = 0; i < matches.size(); i++) {
+                int[] m = matches.get(i);
+                try {
+                    h.addHighlight(m[0], m[1], i == currentIndex ? CURRENT_PAINT : MATCH_PAINT);
+                } catch (javax.swing.text.BadLocationException ignored) {
+                    // Text changed under us; skip this one.
+                }
+            }
+            counter.setText((currentIndex + 1) + " / " + matches.size());
+        }
+
+        private void scrollToCurrent() {
+            if (currentIndex < 0 || currentIndex >= matches.size()) return;
+            int[] m = matches.get(currentIndex);
+            try {
+                target.setCaretPosition(m[0]);
+                java.awt.Rectangle rect = target.modelToView2D(m[0]).getBounds();
+                target.scrollRectToVisible(rect);
+                // Also bring the end of the match into view if the match is wide.
+                java.awt.Rectangle endRect = target.modelToView2D(m[1]).getBounds();
+                rect.add(endRect);
+                target.scrollRectToVisible(rect);
+            } catch (Exception ignored) {}
+        }
+
+        /** Re-run the search against the (possibly updated) text in target.
+         *  Useful to call after the textarea content changes. */
+        void refresh() {
+            if (input.getText() == null || input.getText().isEmpty()) return;
+            recomputeAndJump(false);
         }
     }
 
@@ -806,6 +1005,8 @@ public class VerbTamper implements BurpExtension {
 
         private final JTextArea requestArea;
         private final JTextArea responseArea;
+        private final SearchBar requestSearchBar;
+        private final SearchBar responseSearchBar;
         private final JComboBox<String> verbCombo;        private final JButton sendBtn;
         private final JButton scanBtn;
         private final JButton repeaterBtn;
@@ -849,6 +1050,11 @@ public class VerbTamper implements BurpExtension {
             JScrollPane reqScroll = new JScrollPane(requestArea);
             reqScroll.setBorder(BorderFactory.createTitledBorder("Request (editable)"));
 
+            requestSearchBar = new SearchBar(requestArea, "Search request:");
+            JPanel reqPanel = new JPanel(new BorderLayout());
+            reqPanel.add(reqScroll, BorderLayout.CENTER);
+            reqPanel.add(requestSearchBar, BorderLayout.SOUTH);
+
             responseArea = new JTextArea();
             responseArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
             responseArea.setEditable(false);
@@ -858,7 +1064,12 @@ public class VerbTamper implements BurpExtension {
             JScrollPane respScroll = new JScrollPane(responseArea);
             respScroll.setBorder(BorderFactory.createTitledBorder("Response"));
 
-            JSplitPane mainSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT, reqScroll, respScroll);
+            responseSearchBar = new SearchBar(responseArea, "Search response:");
+            JPanel respPanel = new JPanel(new BorderLayout());
+            respPanel.add(respScroll, BorderLayout.CENTER);
+            respPanel.add(responseSearchBar, BorderLayout.SOUTH);
+
+            JSplitPane mainSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT, reqPanel, respPanel);
             mainSplit.setResizeWeight(0.5);
             mainSplit.setDividerSize(6);
             // Force a 50/50 initial split. Timing is tricky: at construction
