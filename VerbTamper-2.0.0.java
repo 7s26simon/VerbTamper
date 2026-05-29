@@ -87,6 +87,10 @@ public class VerbTamper implements BurpExtension {
 
     private VerbTamperPanel mainPanel;
     private Registration tabRegistration;
+    // Our registered suite-tab component. Held so we can switch to the Scanner
+    // sub-tab and flash the suite tab when a request is sent in.
+    private JTabbedPane suiteTabs;
+    private static final int SCANNER_TAB_INDEX = 0;
 
     @Override
     public void initialize(MontoyaApi api) {
@@ -95,14 +99,77 @@ public class VerbTamper implements BurpExtension {
         this.historyPanel = new ScanHistoryPanel();
         this.sendHistoryPanel = new SendHistoryPanel();
 
-        JTabbedPane tabs = new JTabbedPane();
-        tabs.addTab("Scanner", mainPanel);
-        tabs.addTab("Send History", sendHistoryPanel);
-        tabs.addTab("Scan History", historyPanel);
+        suiteTabs = new JTabbedPane();
+        suiteTabs.addTab("Scanner", mainPanel);
+        suiteTabs.addTab("Send History", sendHistoryPanel);
+        suiteTabs.addTab("Scan History", historyPanel);
 
         api.userInterface().registerContextMenuItemsProvider(new VerbContextMenuProvider());
-        this.tabRegistration = api.userInterface().registerSuiteTab("Verb Tamper", tabs);
-        api.logging().logToOutput("Verb Tamper 1.8.2 loaded.");
+        this.tabRegistration = api.userInterface().registerSuiteTab("Verb Tamper", suiteTabs);
+        api.logging().logToOutput("Verb Tamper 2.0.0 loaded.");
+    }
+
+    /**
+     * When a request is sent into Verb Tamper: select the Scanner sub-tab (so
+     * the extension is showing the Scanner the next time the user opens it,
+     * even if they'd left it on Scan/Send History) and flash an orange dot
+     * beside the "Verb Tamper" title in Burp's top tab bar, mimicking the
+     * notification Repeater shows when you send a request to it.
+     *
+     * This deliberately does NOT steal focus -- it won't pull the user away
+     * from whatever Burp tab they're on; the dot is the cue to come look.
+     *
+     * Montoya has no API to decorate a suite tab, so this walks the Swing
+     * hierarchy up from our registered component to Burp's main JTabbedPane and
+     * temporarily swaps in a title + dot tab component, restoring the original
+     * after a beat. Best-effort: if the hierarchy isn't what we expect it
+     * simply no-ops. Must be called on the EDT.
+     */
+    private void notifyRequestReceived() {
+        if (suiteTabs == null) return;
+        suiteTabs.setSelectedIndex(SCANNER_TAB_INDEX);
+
+        Component child = suiteTabs;
+        Container parent = child.getParent();
+        while (parent != null && !(parent instanceof JTabbedPane)) {
+            child = parent;
+            parent = parent.getParent();
+        }
+        if (!(parent instanceof JTabbedPane)) return;
+        final JTabbedPane mainBar = (JTabbedPane) parent;
+        final int idx = mainBar.indexOfComponent(child);
+        if (idx < 0) return;
+
+        final Component prevTabComponent = mainBar.getTabComponentAt(idx);
+        JPanel dotTab = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        dotTab.setOpaque(false);
+        JLabel titleLabel = new JLabel(mainBar.getTitleAt(idx));
+        titleLabel.setForeground(mainBar.getForegroundAt(idx));
+        JLabel dot = new JLabel("\u25CF");
+        dot.setFont(dot.getFont().deriveFont(dot.getFont().getSize2D() + 3f));
+        dot.setForeground(new Color(255, 102, 51));
+        dotTab.add(titleLabel);
+        dotTab.add(dot);
+        // Pulse the dot: fade it in and out twice, then restore the original
+        // tab. The dot stays installed and we animate its alpha so it fades
+        // smoothly rather than snapping on/off. |sin| over two periods gives
+        // two humps, starting and ending invisible.
+        dot.setForeground(new Color(255, 102, 51, 0));
+        mainBar.setTabComponentAt(idx, dotTab);
+        final int steps = 50;
+        final int[] step = {0};
+        javax.swing.Timer fade = new javax.swing.Timer(33, null);
+        fade.addActionListener(ev -> {
+            step[0]++;
+            double p = (double) step[0] / steps;
+            int alpha = (int) Math.round(255 * Math.abs(Math.sin(p * 2 * Math.PI)));
+            dot.setForeground(new Color(255, 102, 51, alpha));
+            if (step[0] >= steps) {
+                fade.stop();
+                mainBar.setTabComponentAt(idx, prevTabComponent);
+            }
+        });
+        fade.start();
     }
 
     private void highlightProxyItem(HttpRequest req) {
@@ -194,6 +261,31 @@ public class VerbTamper implements BurpExtension {
             }
         });
 
+        JButton repeaterBtn = new JButton("→ Repeater");
+        repeaterBtn.setToolTipText("Send the selected row's request to Burp Repeater");
+        repeaterBtn.addActionListener(e -> {
+            int row = table.getSelectedRow();
+            if (row < 0 || row >= session.records.size()) {
+                JOptionPane.showMessageDialog(null, "Select a row first.",
+                        "Send to Repeater", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            ScanRecord rec = session.records.get(row);
+            if (session.service == null || rec.fullRequest == null || rec.fullRequest.isEmpty()) {
+                JOptionPane.showMessageDialog(null, "This result can't be sent to Repeater.",
+                        "Send to Repeater", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            try {
+                HttpRequest req = HttpRequest.httpRequest(session.service, rec.fullRequest);
+                api.repeater().sendToRepeater(req, "Verb Tamper Scan - " + rec.verb);
+            } catch (Exception ex) {
+                api.logging().logToError("[VerbTamper] Scan -> Repeater failed: " + ex);
+                JOptionPane.showMessageDialog(null, "Send to Repeater failed: " + ex.getMessage(),
+                        "Send to Repeater", JOptionPane.ERROR_MESSAGE);
+            }
+        });
+
         JButton copyFullBtn = new JButton("Copy Full Response");
         copyFullBtn.addActionListener(e -> {
             String txt = fullRespArea.getText();
@@ -214,6 +306,7 @@ public class VerbTamper implements BurpExtension {
         JPanel rightButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
         rightButtons.add(exportBtn);
         rightButtons.add(copyReqBtn);
+        rightButtons.add(repeaterBtn);
         rightButtons.add(copyFullBtn);
 
         JPanel topRow = new JPanel(new BorderLayout());
@@ -414,15 +507,19 @@ public class VerbTamper implements BurpExtension {
         // (inject each bypass header one at a time). Drives the results dialog
         // title and first-column label, including on History-tab replays.
         final String scanType;
+        // The service the scan ran against, kept so results can be re-sent to
+        // Repeater (the request text alone doesn't carry host/port/TLS).
+        final HttpService service;
         final List<ScanRecord> records = new ArrayList<>();
 
-        ScanSession(String host, String path, String originalVerb, int expectedCount, String scanType) {
+        ScanSession(String host, String path, String originalVerb, int expectedCount, String scanType, HttpService service) {
             this.timestampMs = System.currentTimeMillis();
             this.host = host;
             this.path = path;
             this.originalVerb = originalVerb;
             this.expectedCount = expectedCount;
             this.scanType = scanType;
+            this.service = service;
         }
 
         String displayTitle() {
@@ -1061,7 +1158,10 @@ public class VerbTamper implements BurpExtension {
             JMenuItem item = new JMenuItem("Send to Verb Tamper");
             item.addActionListener(e -> {
                 highlightProxyItem(req);
-                SwingUtilities.invokeLater(() -> mainPanel.loadRequest(req));
+                SwingUtilities.invokeLater(() -> {
+                    mainPanel.loadRequest(req);
+                    notifyRequestReceived();
+                });
             });
             items.add(item);
             return items;
@@ -1649,7 +1749,7 @@ public class VerbTamper implements BurpExtension {
             String originalVerb = (String) verbCombo.getSelectedItem();
             String path = rawText.split("\r?\n")[0].replaceAll("^\\w+\\s", "").replaceAll("\\s.*", "");
             String host = currentService != null ? currentService.host() : "";
-            final ScanSession session = new ScanSession(host, path, originalVerb, totalVerbs, "Verbs");
+            final ScanSession session = new ScanSession(host, path, originalVerb, totalVerbs, "Verbs", currentService);
 
             // Open the live results dialog. Rows will get appended as workers complete.
             final DefaultTableModel model = showScanResultsDialog(session, true);
@@ -1756,7 +1856,7 @@ public class VerbTamper implements BurpExtension {
 
             String path = rawText.split("\r?\n")[0].replaceAll("^\\w+\\s", "").replaceAll("\\s.*", "");
             String host = currentService.host();
-            final ScanSession session = new ScanSession(host, path, "GET", totalHeaders, "Headers");
+            final ScanSession session = new ScanSession(host, path, "GET", totalHeaders, "Headers", currentService);
 
             final DefaultTableModel model = showScanResultsDialog(session, true);
 
