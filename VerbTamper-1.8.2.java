@@ -102,7 +102,7 @@ public class VerbTamper implements BurpExtension {
 
         api.userInterface().registerContextMenuItemsProvider(new VerbContextMenuProvider());
         this.tabRegistration = api.userInterface().registerSuiteTab("Verb Tamper", tabs);
-        api.logging().logToOutput("Verb Tamper 1.8.1 loaded.");
+        api.logging().logToOutput("Verb Tamper 1.8.2 loaded.");
     }
 
     private void highlightProxyItem(HttpRequest req) {
@@ -131,7 +131,9 @@ public class VerbTamper implements BurpExtension {
      * replay callers can ignore the return value.
      */
     private DefaultTableModel showScanResultsDialog(ScanSession session, boolean live) {
-        String[] cols = {"Verb", "Status", "Length", "Response Preview"};
+        boolean headerScan = "Headers".equals(session.scanType);
+        String firstCol = headerScan ? "Header" : "Verb";
+        String[] cols = {firstCol, "Status", "Length", "Response Preview"};
         DefaultTableModel model = new DefaultTableModel(cols, 0) {
             @Override public boolean isCellEditable(int r, int c) { return false; }
         };
@@ -139,7 +141,7 @@ public class VerbTamper implements BurpExtension {
         table.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
         table.setRowHeight(22);
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        table.getColumnModel().getColumn(0).setPreferredWidth(70);
+        table.getColumnModel().getColumn(0).setPreferredWidth(headerScan ? 260 : 70);
         table.getColumnModel().getColumn(1).setPreferredWidth(80);
         table.getColumnModel().getColumn(2).setPreferredWidth(70);
         table.getColumnModel().getColumn(3).setPreferredWidth(400);
@@ -180,6 +182,18 @@ public class VerbTamper implements BurpExtension {
             }
         });
 
+        JButton copyReqBtn = new JButton("Copy Full Request");
+        copyReqBtn.setToolTipText("Copy the exact request that was sent for the selected row");
+        copyReqBtn.addActionListener(e -> {
+            int row = table.getSelectedRow();
+            if (row >= 0 && row < session.records.size()) {
+                String req = session.records.get(row).fullRequest;
+                if (req != null && !req.isEmpty()) {
+                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(req), null);
+                }
+            }
+        });
+
         JButton copyFullBtn = new JButton("Copy Full Response");
         copyFullBtn.addActionListener(e -> {
             String txt = fullRespArea.getText();
@@ -199,6 +213,7 @@ public class VerbTamper implements BurpExtension {
 
         JPanel rightButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
         rightButtons.add(exportBtn);
+        rightButtons.add(copyReqBtn);
         rightButtons.add(copyFullBtn);
 
         JPanel topRow = new JPanel(new BorderLayout());
@@ -211,7 +226,7 @@ public class VerbTamper implements BurpExtension {
         SwingUtilities.invokeLater(() -> scanSplit.setDividerLocation(0.5));
 
         JDialog dialog = new JDialog();
-        dialog.setTitle("Scan All Verbs \u2014 " + session.displayTitle());
+        dialog.setTitle("Scan All " + session.scanType + " \u2014 " + session.displayTitle());
         dialog.setSize(800, 600);
         dialog.setLocationRelativeTo(null);
         dialog.setLayout(new BorderLayout(4, 4));
@@ -373,13 +388,15 @@ public class VerbTamper implements BurpExtension {
         final int length;
         final String preview;
         final String fullResponse;
+        final String fullRequest;   // the exact request text that was sent
 
-        ScanRecord(String verb, String status, int length, String preview, String fullResponse) {
+        ScanRecord(String verb, String status, int length, String preview, String fullResponse, String fullRequest) {
             this.verb = verb;
             this.status = status;
             this.length = length;
             this.preview = preview;
             this.fullResponse = fullResponse;
+            this.fullRequest = fullRequest;
         }
     }
 
@@ -393,14 +410,19 @@ public class VerbTamper implements BurpExtension {
         // from records.size() so the live progress label can show "N of M"
         // before all the workers have completed.
         final int expectedCount;
+        // What the scan varied: "Verbs" (try each HTTP method) or "Headers"
+        // (inject each bypass header one at a time). Drives the results dialog
+        // title and first-column label, including on History-tab replays.
+        final String scanType;
         final List<ScanRecord> records = new ArrayList<>();
 
-        ScanSession(String host, String path, String originalVerb, int expectedCount) {
+        ScanSession(String host, String path, String originalVerb, int expectedCount, String scanType) {
             this.timestampMs = System.currentTimeMillis();
             this.host = host;
             this.path = path;
             this.originalVerb = originalVerb;
             this.expectedCount = expectedCount;
+            this.scanType = scanType;
         }
 
         String displayTitle() {
@@ -1070,6 +1092,11 @@ public class VerbTamper implements BurpExtension {
 
         private HttpService currentService = null;
         private boolean loading = false;
+        // The bypass header most recently inserted via the dropdown. Picking a
+        // different entry removes this one first, so only one bypass header is
+        // active at a time (the dropdown replaces rather than stacks). Reset
+        // whenever a fresh request is loaded into the editor.
+        private BypassHeader lastBypassHeader = null;
         // Tracks the previous selection so we can revert if the user picks
         // "Custom..." and then cancels the prompt dialog.
         private int lastSelectedVerbIndex = 0;
@@ -1163,7 +1190,8 @@ public class VerbTamper implements BurpExtension {
             sendBtn.setOpaque(true);
             sendBtn.setEnabled(false);
 
-            scanBtn = new JButton("Scan All Verbs");
+            scanBtn = new JButton("Scan All \u25BE");
+            scanBtn.setToolTipText("Choose a scan: all verbs, or all bypass headers (GET only)");
             scanBtn.setBackground(new Color(70, 100, 180));
             scanBtn.setForeground(Color.WHITE);
             scanBtn.setOpaque(true);
@@ -1266,7 +1294,16 @@ public class VerbTamper implements BurpExtension {
                 requestArea.setCaretPosition(Math.min(caret, updated.length()));
             });
             sendBtn.addActionListener(e -> doSend());
-            scanBtn.addActionListener(e -> doScan());
+            scanBtn.addActionListener(e -> {
+                JPopupMenu scanMenu = new JPopupMenu();
+                JMenuItem verbsItem = new JMenuItem("Scan All Verbs");
+                verbsItem.addActionListener(ev -> doScan());
+                JMenuItem headersItem = new JMenuItem("Scan All Headers");
+                headersItem.addActionListener(ev -> doScanHeaders());
+                scanMenu.add(verbsItem);
+                scanMenu.add(headersItem);
+                scanMenu.show(scanBtn, 0, scanBtn.getHeight());
+            });
             backBtn.addActionListener(e -> navigate(-1));
             forwardBtn.addActionListener(e -> navigate(1));
             clearBtn.addActionListener(e -> {
@@ -1281,6 +1318,7 @@ public class VerbTamper implements BurpExtension {
                 diffBtn.setEnabled(false);
                 followRedirectBtn.setEnabled(false);
                 currentService = null;
+                lastBypassHeader = null;
                 // Drop any custom verbs the user added via "Custom..." so the
                 // dropdown resets to its initial state. Anything past the
                 // standard verbs that isn't the sentinel is user-entered.
@@ -1442,6 +1480,7 @@ public class VerbTamper implements BurpExtension {
 
         void loadRequest(HttpRequest req) {
             currentService = req.httpService();
+            lastBypassHeader = null;
             loading = true;
             String method = req.method().toUpperCase();
             selectVerbInCombo(method);
@@ -1610,50 +1649,19 @@ public class VerbTamper implements BurpExtension {
             String originalVerb = (String) verbCombo.getSelectedItem();
             String path = rawText.split("\r?\n")[0].replaceAll("^\\w+\\s", "").replaceAll("\\s.*", "");
             String host = currentService != null ? currentService.host() : "";
-            final ScanSession session = new ScanSession(host, path, originalVerb, totalVerbs);
+            final ScanSession session = new ScanSession(host, path, originalVerb, totalVerbs, "Verbs");
 
             // Open the live results dialog. Rows will get appended as workers complete.
             final DefaultTableModel model = showScanResultsDialog(session, true);
 
             final AtomicInteger done = new AtomicInteger(0);
             for (final String verb : verbsToScan) {
+                final String verbRaw = swapMethod(rawText, verb);
                 new Thread(() -> {
                     try {
-                        String verbRaw = swapMethod(rawText, verb);
                         HttpRequest req = HttpRequest.httpRequest(currentService, verbRaw);
                         HttpRequestResponse result = api.http().sendRequest(req, mode);
-                        String respText;
-                        if (result.response() != null) {
-                            try {
-                                byte[] bytes = result.response().toByteArray().getBytes();
-                                respText = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
-                                if (respText.isEmpty()) {
-                                    StringBuilder sb = new StringBuilder();
-                                    sb.append(result.response().httpVersion()).append(' ')
-                                      .append(result.response().statusCode()).append(' ')
-                                      .append(result.response().reasonPhrase()).append("\r\n");
-                                    result.response().headers().forEach(h ->
-                                        sb.append(h.name()).append(": ").append(h.value()).append("\r\n"));
-                                    sb.append("\r\n").append(result.response().bodyToString());
-                                    respText = sb.toString();
-                                }
-                            } catch (Exception readErr) {
-                                respText = result.response().toString();
-                            }
-                        } else {
-                            respText = "(no response)";
-                        }
-                        String[] respLines = respText.split("\r?\n");
-                        String statusCode = respLines.length > 0 ? respLines[0].replaceAll("HTTP/\\S+\\s+", "").trim() : "?";
-                        String statusNum = statusCode.length() >= 3 ? statusCode.substring(0, 3) : statusCode;
-                        int length = respText.length();
-                        String preview = "";
-                        for (int j = respLines.length - 1; j >= 0; j--) {
-                            if (!respLines[j].trim().isEmpty()) { preview = respLines[j]; break; }
-                        }
-                        if (preview.length() > 100) preview = preview.substring(0, 100) + "...";
-
-                        final ScanRecord record = new ScanRecord(verb, statusNum, length, preview, respText);
+                        final ScanRecord record = recordFrom(verb, verbRaw, result);
                         SwingUtilities.invokeLater(() -> {
                             session.records.add(record);
                             model.addRow(new Object[]{record.verb, record.status, "" + record.length, record.preview});
@@ -1661,7 +1669,7 @@ public class VerbTamper implements BurpExtension {
                             if (n >= totalVerbs) finalizeScan(session);
                         });
                     } catch (Exception ex) {
-                        final ScanRecord record = new ScanRecord(verb, "ERR", 0, ex.getMessage(), "Error: " + ex.getMessage());
+                        final ScanRecord record = new ScanRecord(verb, "ERR", 0, ex.getMessage(), "Error: " + ex.getMessage(), verbRaw);
                         SwingUtilities.invokeLater(() -> {
                             session.records.add(record);
                             model.addRow(new Object[]{record.verb, "ERR", "-", record.preview});
@@ -1677,6 +1685,143 @@ public class VerbTamper implements BurpExtension {
         private void finalizeScan(ScanSession session) {
             scanHistory.add(session);
             if (historyPanel != null) historyPanel.refresh();
+        }
+
+        /**
+         * Turn a Montoya response into a result row labelled with the given
+         * string (the verb for a verb scan, the header for a header scan).
+         * Shared by doScan and doScanHeaders so both render rows identically.
+         */
+        private ScanRecord recordFrom(String label, String requestText, HttpRequestResponse result) {
+            String respText;
+            if (result.response() != null) {
+                try {
+                    byte[] bytes = result.response().toByteArray().getBytes();
+                    respText = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                    if (respText.isEmpty()) {
+                        StringBuilder sb = new StringBuilder();
+                        sb.append(result.response().httpVersion()).append(' ')
+                          .append(result.response().statusCode()).append(' ')
+                          .append(result.response().reasonPhrase()).append("\r\n");
+                        result.response().headers().forEach(h ->
+                            sb.append(h.name()).append(": ").append(h.value()).append("\r\n"));
+                        sb.append("\r\n").append(result.response().bodyToString());
+                        respText = sb.toString();
+                    }
+                } catch (Exception readErr) {
+                    respText = result.response().toString();
+                }
+            } else {
+                respText = "(no response)";
+            }
+            String[] respLines = respText.split("\r?\n");
+            String statusCode = respLines.length > 0 ? respLines[0].replaceAll("HTTP/\\S+\\s+", "").trim() : "?";
+            String statusNum = statusCode.length() >= 3 ? statusCode.substring(0, 3) : statusCode;
+            int length = respText.length();
+            String preview = "";
+            for (int j = respLines.length - 1; j >= 0; j--) {
+                if (!respLines[j].trim().isEmpty()) { preview = respLines[j]; break; }
+            }
+            if (preview.length() > 100) preview = preview.substring(0, 100) + "...";
+            return new ScanRecord(label, statusNum, length, preview, respText, requestText);
+        }
+
+        /**
+         * Scan All Headers: send the request once per bypass header, injecting
+         * (or replacing) just that one header each time on a fresh copy of the
+         * original request, and collect the responses into the same live results
+         * dialog used by Scan All Verbs.
+         *
+         * Restricted to GET requests -- the bypass headers (IP spoofing, URL
+         * rewriting, method override) are about how the server treats a plain
+         * read, so the outer request is held to GET throughout. Unlike the
+         * manual header inserter, method-override entries do NOT flip the verb.
+         */
+        private void doScanHeaders() {
+            if (currentService == null) return;
+            final String rawText = sanitiseHeaders(requestArea.getText());
+            String method = rawText.split("\r?\n")[0].trim().split("\\s+")[0];
+            if (!"GET".equalsIgnoreCase(method)) {
+                JOptionPane.showMessageDialog(this,
+                        "Scan All Headers only runs on GET requests.\nThe current request is "
+                                + method + ". Switch the verb to GET and try again.",
+                        "Scan All Headers", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            boolean isHttp2 = rawText.split("\r?\n")[0].toUpperCase().contains("HTTP/2");
+            final HttpMode mode = isHttp2 ? HttpMode.HTTP_2 : HttpMode.AUTO;
+
+            final int totalHeaders = BYPASS_HEADERS.length;
+            if (totalHeaders == 0) return;
+
+            String path = rawText.split("\r?\n")[0].replaceAll("^\\w+\\s", "").replaceAll("\\s.*", "");
+            String host = currentService.host();
+            final ScanSession session = new ScanSession(host, path, "GET", totalHeaders, "Headers");
+
+            final DefaultTableModel model = showScanResultsDialog(session, true);
+
+            // One worker walks the headers sequentially: each iteration starts
+            // from the pristine request and injects exactly one header, so the
+            // previously injected header is effectively replaced each time.
+            new Thread(() -> {
+                final AtomicInteger done = new AtomicInteger(0);
+                for (final BypassHeader h : BYPASS_HEADERS) {
+                    final String label = h.name + ": " + h.defaultValue;
+                    final String headerRaw = sanitiseHeaders(withHeader(rawText, h.name, h.defaultValue));
+                    ScanRecord rec;
+                    try {
+                        HttpRequest req = HttpRequest.httpRequest(currentService, headerRaw);
+                        HttpRequestResponse result = api.http().sendRequest(req, mode);
+                        rec = recordFrom(label, headerRaw, result);
+                    } catch (Exception ex) {
+                        rec = new ScanRecord(label, "ERR", 0, ex.getMessage(), "Error: " + ex.getMessage(), headerRaw);
+                    }
+                    final ScanRecord record = rec;
+                    SwingUtilities.invokeLater(() -> {
+                        session.records.add(record);
+                        model.addRow(new Object[]{record.verb,
+                                record.status.isEmpty() ? "-" : record.status,
+                                record.length == 0 && "ERR".equals(record.status) ? "-" : "" + record.length,
+                                record.preview});
+                        int n = done.incrementAndGet();
+                        if (n >= totalHeaders) finalizeScan(session);
+                    });
+                }
+            }, "VerbTamper-ScanHeaders").start();
+        }
+
+        /**
+         * Pure header insert/replace used by the header scan: returns a copy of
+         * raw with "name: value" placed after the Host line (or replacing an
+         * existing same-named header). Mirrors insertOrReplaceHeader's placement
+         * rules but does not touch the UI or flip the verb. The result is in \n
+         * form; callers run it back through sanitiseHeaders before sending.
+         */
+        private String withHeader(String raw, String name, String value) {
+            String normalised = raw.replace("\r\n", "\n").replace("\r", "\n");
+            int blank = normalised.indexOf("\n\n");
+            String headerPart;
+            String bodyPart;
+            if (blank == -1) {
+                headerPart = normalised;
+                bodyPart = "";
+            } else {
+                headerPart = normalised.substring(0, blank);
+                bodyPart = normalised.substring(blank);
+            }
+            String replacement = name + ": " + value;
+            String newHeaderPart;
+            if (headerPart.matches("(?is).*(^|\\n)" + java.util.regex.Pattern.quote(name) + ":.*")) {
+                newHeaderPart = headerPart.replaceAll(
+                        "(?im)^" + java.util.regex.Pattern.quote(name) + ":.*$", replacement);
+            } else if (headerPart.matches("(?is).*(^|\\n)Host:.*")) {
+                newHeaderPart = headerPart.replaceFirst("(?im)^(Host:.*)$", "$1\n" + replacement);
+            } else {
+                String trimmed = headerPart;
+                while (trimmed.endsWith("\n")) trimmed = trimmed.substring(0, trimmed.length() - 1);
+                newHeaderPart = trimmed + "\n" + replacement;
+            }
+            return newHeaderPart + bodyPart;
         }
 
         /** True if the response text starts with an HTTP/X 3xx status and has a
@@ -1943,6 +2088,7 @@ public class VerbTamper implements BurpExtension {
             if (newIndex < 0 || newIndex >= history.size()) return;
             historyIndex = newIndex;
             HistoryEntry entry = history.get(historyIndex);
+            lastBypassHeader = null;
             navigating = true;
             selectVerbInCombo(entry.verb);
             requestArea.setForeground(UIManager.getColor("TextArea.foreground"));
@@ -2264,6 +2410,15 @@ public class VerbTamper implements BurpExtension {
                 bodyPart = normalised.substring(blank);  // keep the \n\n separator
             }
 
+            // Replace-not-stack: if a previous dropdown pick is still in the
+            // request and it's a different header, strip that line first so we
+            // don't accumulate one bypass header per selection.
+            if (lastBypassHeader != null && !lastBypassHeader.name.equalsIgnoreCase(h.name)) {
+                headerPart = headerPart.replaceAll(
+                        "(?im)^" + java.util.regex.Pattern.quote(lastBypassHeader.name) + ":.*(?:\\n|$)", "");
+                while (headerPart.endsWith("\n")) headerPart = headerPart.substring(0, headerPart.length() - 1);
+            }
+
             // Case-insensitive check for existing header.
             String existingPattern = "(?im)^" + java.util.regex.Pattern.quote(h.name) + ":.*$";
             String replacement = h.name + ": " + h.defaultValue;
@@ -2303,6 +2458,7 @@ public class VerbTamper implements BurpExtension {
             }
             requestArea.setText(combined);
             requestArea.setCaretPosition(0);
+            lastBypassHeader = h;
 
             // If this is a method-override header, also flip the verb dropdown.
             String extraMsg = "";
