@@ -1,0 +1,6 @@
+# Build artifacts
+build/
+*.jar
+
+# macOS
+.DS_Store
