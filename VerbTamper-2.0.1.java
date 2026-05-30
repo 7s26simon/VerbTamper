@@ -1906,7 +1906,11 @@ public class VerbTamper implements BurpExtension {
          * form; callers run it back through sanitiseHeaders before sending.
          */
         private String withHeader(String raw, String name, String value) {
-            String normalised = raw.replace("\r\n", "\n").replace("\r", "\n");
+            // Normalise CRLF to \n; strip any *lone* \r (not part of \r\n). A bare
+            // carriage return is never valid inside an HTTP header value, so it's
+            // almost always a paste artifact. Dropping it (rather than converting
+            // it to a newline) avoids fabricating a spurious header split.
+            String normalised = raw.replace("\r\n", "\n").replace("\r", "");
             int blank = normalised.indexOf("\n\n");
             String headerPart;
             String bodyPart;
@@ -2103,7 +2107,11 @@ public class VerbTamper implements BurpExtension {
          */
         private String buildGetRequestFromCurrent(HttpService target, String targetPath) {
             String raw = requestArea.getText();
-            String normalised = raw.replace("\r\n", "\n").replace("\r", "\n");
+            // Normalise CRLF to \n; strip any *lone* \r (not part of \r\n). A bare
+            // carriage return is never valid inside an HTTP header value, so it's
+            // almost always a paste artifact. Dropping it (rather than converting
+            // it to a newline) avoids fabricating a spurious header split.
+            String normalised = raw.replace("\r\n", "\n").replace("\r", "");
             int blank = normalised.indexOf("\n\n");
             String headerPart = blank == -1 ? normalised : normalised.substring(0, blank);
 
@@ -2506,7 +2514,11 @@ public class VerbTamper implements BurpExtension {
 
             // Work in normalised \n space; the existing sanitiseHeaders will
             // convert back to CRLF when sending.
-            String normalised = raw.replace("\r\n", "\n").replace("\r", "\n");
+            // Normalise CRLF to \n; strip any *lone* \r (not part of \r\n). A bare
+            // carriage return is never valid inside an HTTP header value, so it's
+            // almost always a paste artifact. Dropping it (rather than converting
+            // it to a newline) avoids fabricating a spurious header split.
+            String normalised = raw.replace("\r\n", "\n").replace("\r", "");
             int blank = normalised.indexOf("\n\n");
             String headerPart;
             String bodyPart;
@@ -2593,7 +2605,11 @@ public class VerbTamper implements BurpExtension {
          * happen to contain patterns the regex matches.
          */
         private String sanitiseHeaders(String raw) {
-            String normalised = raw.replace("\r\n", "\n").replace("\r", "\n");
+            // Normalise CRLF to \n; strip any *lone* \r (not part of \r\n). A bare
+            // carriage return is never valid inside an HTTP header value, so it's
+            // almost always a paste artifact. Dropping it (rather than converting
+            // it to a newline) avoids fabricating a spurious header split.
+            String normalised = raw.replace("\r\n", "\n").replace("\r", "");
 
             // Split at the first blank line — everything before it is headers,
             // everything after is the body (which we leave untouched).
