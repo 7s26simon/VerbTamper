@@ -95,8 +95,7 @@ public class VerbTamper implements BurpExtension {
     // Monotonic counter used to give each "Send to Repeater" a unique tab
     // caption, so successive sends produce distinguishable Repeater tabs
     // instead of a stack of identically-named ones.
-    private static final java.util.concurrent.atomic.AtomicInteger repeaterTabCounter =
-            new java.util.concurrent.atomic.AtomicInteger();
+    private static final AtomicInteger repeaterTabCounter = new AtomicInteger();
 
     @Override
     public void initialize(MontoyaApi api) {
@@ -112,7 +111,7 @@ public class VerbTamper implements BurpExtension {
 
         api.userInterface().registerContextMenuItemsProvider(new VerbContextMenuProvider());
         this.tabRegistration = api.userInterface().registerSuiteTab("Verb Tamper", suiteTabs);
-        api.logging().logToOutput("Verb Tamper 2.0.1 loaded.");
+        api.logging().logToOutput("Verb Tamper 2.1.0 loaded.");
     }
 
     /**
@@ -310,6 +309,25 @@ public class VerbTamper implements BurpExtension {
                 : "Replay \u2014 " + session.records.size() + " results");
         scanStatus.setBorder(new EmptyBorder(4, 8, 4, 8));
 
+        // Stop/Resume toggle (live scans only). Pauses the worker between
+        // requests and flips its own label; disabled once the scan finishes.
+        final JButton stopBtn = new JButton("Stop");
+        stopBtn.setToolTipText("Pause the scan after the current request; click Resume to continue");
+        stopBtn.addActionListener(e -> {
+            boolean nowPaused = !session.paused;
+            session.setPaused(nowPaused);
+            int n = model.getRowCount();
+            if (nowPaused) {
+                stopBtn.setText("Resume");
+                scanStatus.setText("Paused \u2014 " + n + " / " + session.expectedCount);
+            } else {
+                stopBtn.setText("Stop");
+                scanStatus.setText(n < session.expectedCount
+                        ? "Scanning " + n + " / " + session.expectedCount + "..."
+                        : "Done \u2014 click any row to see the full response");
+            }
+        });
+
         JPanel rightButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
         rightButtons.add(exportBtn);
         rightButtons.add(copyReqBtn);
@@ -317,6 +335,11 @@ public class VerbTamper implements BurpExtension {
         rightButtons.add(copyFullBtn);
 
         JPanel topRow = new JPanel(new BorderLayout());
+        if (live) {
+            JPanel leftButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+            leftButtons.add(stopBtn);
+            topRow.add(leftButtons, BorderLayout.WEST);
+        }
         topRow.add(scanStatus, BorderLayout.CENTER);
         topRow.add(rightButtons, BorderLayout.EAST);
 
@@ -332,6 +355,16 @@ public class VerbTamper implements BurpExtension {
         dialog.setLayout(new BorderLayout(4, 4));
         dialog.add(topRow, BorderLayout.NORTH);
         dialog.add(scanSplit, BorderLayout.CENTER);
+        // If the user closes the dialog mid-scan, cancel the worker so a paused
+        // (or still-running) scan thread doesn't linger in the background.
+        if (live) {
+            dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+            dialog.addWindowListener(new java.awt.event.WindowAdapter() {
+                @Override public void windowClosing(java.awt.event.WindowEvent e) {
+                    session.cancel();
+                }
+            });
+        }
         dialog.setVisible(true);
 
         // Replay mode: populate table immediately from existing records.
@@ -341,13 +374,21 @@ public class VerbTamper implements BurpExtension {
             }
         }
 
-        // Live mode: update the status label as rows arrive.
+        // Live mode: update the status label as rows arrive. Stays pause-aware
+        // (a request already in flight when the user hits Stop can still land
+        // a row), and disables the Stop button once every result is in.
         if (live) {
             model.addTableModelListener(e -> {
                 int n = model.getRowCount();
-                scanStatus.setText(n < session.expectedCount
-                        ? "Scanning " + n + " / " + session.expectedCount + "..."
-                        : "Done \u2014 click any row to see the full response");
+                if (session.paused) {
+                    scanStatus.setText("Paused \u2014 " + n + " / " + session.expectedCount);
+                } else if (n < session.expectedCount) {
+                    scanStatus.setText("Scanning " + n + " / " + session.expectedCount + "...");
+                } else {
+                    scanStatus.setText("Done \u2014 click any row to see the full response");
+                    stopBtn.setText("Stop");
+                    stopBtn.setEnabled(false);
+                }
             });
         }
 
@@ -518,6 +559,46 @@ public class VerbTamper implements BurpExtension {
         // Repeater (the request text alone doesn't carry host/port/TLS).
         final HttpService service;
         final List<ScanRecord> records = new ArrayList<>();
+
+        // Live-scan control. The worker thread checks these between requests so
+        // the user can pause/resume from the results dialog in real time.
+        // 'paused' gates the worker on pauseLock; 'cancelled' aborts it entirely
+        // (e.g. when the results dialog is closed) so a paused worker can't leak.
+        volatile boolean paused = false;
+        volatile boolean cancelled = false;
+        final Object pauseLock = new Object();
+
+        /** Block the calling (worker) thread while the scan is paused. Returns
+         *  immediately if the scan is cancelled. Called between requests. */
+        void awaitIfPaused() {
+            synchronized (pauseLock) {
+                while (paused && !cancelled) {
+                    try {
+                        pauseLock.wait();
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+        }
+
+        /** Pause or resume the scan; resuming wakes the blocked worker. */
+        void setPaused(boolean p) {
+            synchronized (pauseLock) {
+                paused = p;
+                if (!p) pauseLock.notifyAll();
+            }
+        }
+
+        /** Abort the scan and wake the worker if it's parked on a pause. */
+        void cancel() {
+            synchronized (pauseLock) {
+                cancelled = true;
+                paused = false;
+                pauseLock.notifyAll();
+            }
+        }
 
         ScanSession(String host, String path, String originalVerb, int expectedCount, String scanType, HttpService service) {
             this.timestampMs = System.currentTimeMillis();
@@ -1759,34 +1840,38 @@ public class VerbTamper implements BurpExtension {
             String host = currentService != null ? currentService.host() : "";
             final ScanSession session = new ScanSession(host, path, originalVerb, totalVerbs, "Verbs", currentService);
 
-            // Open the live results dialog. Rows will get appended as workers complete.
+            // Open the live results dialog. Rows will get appended as the worker
+            // completes each request.
             final DefaultTableModel model = showScanResultsDialog(session, true);
 
-            final AtomicInteger done = new AtomicInteger(0);
-            for (final String verb : verbsToScan) {
-                final String verbRaw = swapMethod(rawText, verb);
-                new Thread(() -> {
+            // A single sequential worker walks the verbs so the scan can be
+            // paused/resumed (and cancelled) between requests from the dialog.
+            new Thread(() -> {
+                for (final String verb : verbsToScan) {
+                    if (session.cancelled) break;
+                    session.awaitIfPaused();
+                    if (session.cancelled) break;
+                    final String verbRaw = swapMethod(rawText, verb);
+                    ScanRecord rec;
                     try {
                         HttpRequest req = HttpRequest.httpRequest(currentService, verbRaw);
                         HttpRequestResponse result = api.http().sendRequest(req, mode);
-                        final ScanRecord record = recordFrom(verb, verbRaw, result);
-                        SwingUtilities.invokeLater(() -> {
-                            session.records.add(record);
-                            model.addRow(new Object[]{record.verb, record.status, "" + record.length, record.preview});
-                            int n = done.incrementAndGet();
-                            if (n >= totalVerbs) finalizeScan(session);
-                        });
+                        rec = recordFrom(verb, verbRaw, result);
                     } catch (Exception ex) {
-                        final ScanRecord record = new ScanRecord(verb, "ERR", 0, ex.getMessage(), "Error: " + ex.getMessage(), verbRaw);
-                        SwingUtilities.invokeLater(() -> {
-                            session.records.add(record);
-                            model.addRow(new Object[]{record.verb, "ERR", "-", record.preview});
-                            int n = done.incrementAndGet();
-                            if (n >= totalVerbs) finalizeScan(session);
-                        });
+                        rec = new ScanRecord(verb, "ERR", 0, ex.getMessage(), "Error: " + ex.getMessage(), verbRaw);
                     }
-                }, "VerbTamper-Scan-" + verb).start();
-            }
+                    final ScanRecord record = rec;
+                    SwingUtilities.invokeLater(() -> {
+                        session.records.add(record);
+                        model.addRow(new Object[]{record.verb,
+                                record.status.isEmpty() ? "-" : record.status,
+                                record.length == 0 && "ERR".equals(record.status) ? "-" : "" + record.length,
+                                record.preview});
+                    });
+                }
+                final boolean completed = !session.cancelled;
+                SwingUtilities.invokeLater(() -> { if (completed) finalizeScan(session); });
+            }, "VerbTamper-Scan").start();
         }
 
         /** Push a completed scan into shared history and refresh the History tab. */
@@ -1872,8 +1957,10 @@ public class VerbTamper implements BurpExtension {
             // from the pristine request and injects exactly one header, so the
             // previously injected header is effectively replaced each time.
             new Thread(() -> {
-                final AtomicInteger done = new AtomicInteger(0);
                 for (final BypassHeader h : BYPASS_HEADERS) {
+                    if (session.cancelled) break;
+                    session.awaitIfPaused();
+                    if (session.cancelled) break;
                     final String label = h.name + ": " + h.defaultValue;
                     final String headerRaw = sanitiseHeaders(withHeader(rawText, h.name, h.defaultValue));
                     ScanRecord rec;
@@ -1891,10 +1978,10 @@ public class VerbTamper implements BurpExtension {
                                 record.status.isEmpty() ? "-" : record.status,
                                 record.length == 0 && "ERR".equals(record.status) ? "-" : "" + record.length,
                                 record.preview});
-                        int n = done.incrementAndGet();
-                        if (n >= totalHeaders) finalizeScan(session);
                     });
                 }
+                final boolean completed = !session.cancelled;
+                SwingUtilities.invokeLater(() -> { if (completed) finalizeScan(session); });
             }, "VerbTamper-ScanHeaders").start();
         }
 
