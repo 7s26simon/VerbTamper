@@ -92,6 +92,12 @@ public class VerbTamper implements BurpExtension {
     private JTabbedPane suiteTabs;
     private static final int SCANNER_TAB_INDEX = 0;
 
+    // Monotonic counter used to give each "Send to Repeater" a unique tab
+    // caption, so successive sends produce distinguishable Repeater tabs
+    // instead of a stack of identically-named ones.
+    private static final java.util.concurrent.atomic.AtomicInteger repeaterTabCounter =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     @Override
     public void initialize(MontoyaApi api) {
         this.api = api;
@@ -278,7 +284,8 @@ public class VerbTamper implements BurpExtension {
             }
             try {
                 HttpRequest req = HttpRequest.httpRequest(session.service, rec.fullRequest);
-                api.repeater().sendToRepeater(req, "Verb Tamper Scan - " + rec.verb);
+                api.repeater().sendToRepeater(req,
+                        "Verb Tamper Scan - " + rec.verb + " #" + repeaterTabCounter.incrementAndGet());
             } catch (Exception ex) {
                 api.logging().logToError("[VerbTamper] Scan -> Repeater failed: " + ex);
                 JOptionPane.showMessageDialog(null, "Send to Repeater failed: " + ex.getMessage(),
@@ -1455,8 +1462,9 @@ public class VerbTamper implements BurpExtension {
                 String updatedRaw = swapMethod(rawText, verb);
                 try {
                     HttpRequest req = HttpRequest.httpRequest(currentService, updatedRaw);
-                    api.repeater().sendToRepeater(req, "Verb Tamper - " + verb);
-                    statusLabel.setText("Sent " + verb + " to Repeater");
+                    String caption = "Verb Tamper - " + verb + " #" + repeaterTabCounter.incrementAndGet();
+                    api.repeater().sendToRepeater(req, caption);
+                    statusLabel.setText("Sent " + verb + " to Repeater (" + caption + ")");
                 } catch (Exception ex) {
                     api.logging().logToError("[VerbTamper] Repeater send failure: " + ex);
                     statusLabel.setText("Repeater send failed: " + ex.getMessage());
