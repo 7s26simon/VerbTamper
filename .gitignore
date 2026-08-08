@@ -1,6 +1,9 @@
 # Build artifacts
 build/
 *.jar
+scripts/burp/
+libs/
+.gradle/
 
 # macOS
 .DS_Store
