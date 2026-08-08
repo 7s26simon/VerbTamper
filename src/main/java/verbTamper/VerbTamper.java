@@ -8,18 +8,31 @@ import burp.api.montoya.http.HttpMode;
 import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.http.message.responses.HttpResponse;
 import burp.api.montoya.proxy.ProxyHttpRequestResponse;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import burp.api.montoya.ui.contextmenu.MessageEditorHttpRequestResponse;
+import burp.api.montoya.ui.editor.EditorOptions;
+import burp.api.montoya.ui.editor.HttpResponseEditor;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+import javax.swing.border.MatteBorder;
+import javax.swing.event.CaretEvent;
+import javax.swing.event.CaretListener;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.text.Element;
+import javax.swing.text.JTextComponent;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.ActionListener;
+import java.awt.geom.Rectangle2D;
+import java.beans.PropertyChangeEvent;
+import java.beans.PropertyChangeListener;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -859,6 +872,150 @@ public class VerbTamper implements BurpExtension {
         }
     }
 
+    /**
+     * Component to display line numbers for a JTextComponent.
+     * Attached as the rowHeaderView of a JScrollPane.
+     */
+    private static class TextLineNumber extends JComponent implements CaretListener, DocumentListener, PropertyChangeListener {
+        private static final int MARGIN = 6;
+
+        private final JTextComponent component;
+        private int lastDigits;
+        private int lastLineCount;
+
+        TextLineNumber(JTextComponent component) {
+            this.component = component;
+            setFont(component.getFont());
+            setBorder(new MatteBorder(0, 0, 0, 1, new Color(128, 128, 128, 70)));
+            setOpaque(true);
+
+            component.addCaretListener(this);
+            component.getDocument().addDocumentListener(this);
+            component.addPropertyChangeListener("font", this);
+            component.addPropertyChangeListener("document", this);
+            updateWidth();
+        }
+
+        private void updateWidth() {
+            Element root = component.getDocument().getDefaultRootElement();
+            int lines = root.getElementCount();
+            int digits = Math.max(2, String.valueOf(lines).length());
+
+            if (digits != lastDigits || lines != lastLineCount) {
+                lastDigits = digits;
+                lastLineCount = lines;
+                FontMetrics fontMetrics = getFontMetrics(getFont());
+                int width = fontMetrics.charWidth('0') * digits + (MARGIN * 2) + 4;
+                Dimension d = getPreferredSize();
+                d.setSize(width, component.getHeight());
+                setPreferredSize(d);
+                setSize(d);
+                revalidate();
+                repaint();
+            }
+        }
+
+        @Override
+        public Font getFont() {
+            if (component != null && component.getFont() != null) {
+                return component.getFont();
+            }
+            return super.getFont();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            Graphics2D g2d = (Graphics2D) g.create();
+            try {
+                g2d.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+
+                Color bg = component.getBackground();
+                g2d.setColor(bg != null ? bg : UIManager.getColor("TextArea.background"));
+                g2d.fillRect(0, 0, getWidth(), getHeight());
+
+                // Right border separator
+                g2d.setColor(new Color(128, 128, 128, 60));
+                g2d.drawLine(getWidth() - 1, 0, getWidth() - 1, getHeight());
+
+                Font font = getFont();
+                g2d.setFont(font);
+                FontMetrics fm = g2d.getFontMetrics(font);
+                int fontAscent = fm.getAscent();
+
+                Rectangle clip = g2d.getClipBounds();
+                if (clip == null) clip = new Rectangle(0, 0, getWidth(), getHeight());
+
+                int rowStartOffset = component.viewToModel2D(new Point(0, clip.y));
+                int endOffset = component.viewToModel2D(new Point(0, clip.y + clip.height));
+
+                Element root = component.getDocument().getDefaultRootElement();
+                int startLine = root.getElementIndex(rowStartOffset);
+                int endLine = root.getElementIndex(endOffset);
+
+                // Muted gutter text color
+                g2d.setColor(new Color(128, 128, 128));
+
+                for (int i = startLine; i <= endLine; i++) {
+                    Element lineElem = root.getElement(i);
+                    int startOfLine = lineElem.getStartOffset();
+                    Rectangle2D r = component.modelToView2D(startOfLine);
+                    if (r != null) {
+                        String lineNumber = String.valueOf(i + 1);
+                        int stringWidth = fm.stringWidth(lineNumber);
+                        int x = getWidth() - 2 - MARGIN - stringWidth;
+                        int y = (int) r.getY() + fontAscent;
+                        g2d.drawString(lineNumber, x, y);
+                    }
+                }
+            } catch (Exception ignored) {
+            } finally {
+                g2d.dispose();
+            }
+        }
+
+        @Override
+        public void caretUpdate(CaretEvent e) {
+            repaint();
+        }
+
+        @Override
+        public void insertUpdate(DocumentEvent e) {
+            updateWidth();
+            repaint();
+        }
+
+        @Override
+        public void removeUpdate(DocumentEvent e) {
+            updateWidth();
+            repaint();
+        }
+
+        @Override
+        public void changedUpdate(DocumentEvent e) {
+            updateWidth();
+            repaint();
+        }
+
+        @Override
+        public void propertyChange(PropertyChangeEvent e) {
+            if ("document".equals(e.getPropertyName())) {
+                if (e.getOldValue() instanceof javax.swing.text.Document) {
+                    ((javax.swing.text.Document) e.getOldValue()).removeDocumentListener(this);
+                }
+                if (e.getNewValue() instanceof javax.swing.text.Document) {
+                    ((javax.swing.text.Document) e.getNewValue()).addDocumentListener(this);
+                }
+                updateWidth();
+                repaint();
+            } else if ("font".equals(e.getPropertyName())) {
+                setFont(component.getFont());
+                updateWidth();
+                repaint();
+            }
+        }
+    }
+
     // Shared across tabs: all scans performed this Burp session.
     private final List<ScanSession> scanHistory = new ArrayList<>();
     private ScanHistoryPanel historyPanel;
@@ -1259,10 +1416,10 @@ public class VerbTamper implements BurpExtension {
     private class VerbTamperPanel extends JPanel {
 
         private final JTextArea requestArea;
-        private final JTextArea responseArea;
+        private final HttpResponseEditor responseEditor;
         private final SearchBar requestSearchBar;
-        private final SearchBar responseSearchBar;
-        private final JComboBox<String> verbCombo;        private final JButton sendBtn;
+        private final JComboBox<String> verbCombo;
+        private final JButton sendBtn;
         private final JButton scanBtn;
         private final JButton repeaterBtn;
         private final JButton backBtn;
@@ -1308,6 +1465,7 @@ public class VerbTamper implements BurpExtension {
             requestArea.setForeground(Color.GRAY);
             attachUrlContextMenu(requestArea, false);
             JScrollPane reqScroll = new JScrollPane(requestArea);
+            reqScroll.setRowHeaderView(new TextLineNumber(requestArea));
             reqScroll.setBorder(BorderFactory.createTitledBorder("Request (editable)"));
 
             requestSearchBar = new SearchBar(requestArea, "Search request:");
@@ -1315,19 +1473,10 @@ public class VerbTamper implements BurpExtension {
             reqPanel.add(reqScroll, BorderLayout.CENTER);
             reqPanel.add(requestSearchBar, BorderLayout.SOUTH);
 
-            responseArea = new JTextArea();
-            responseArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-            responseArea.setEditable(false);
-            responseArea.setBackground(new Color(28, 28, 28));
-            responseArea.setForeground(new Color(180, 255, 180));
-            attachUrlContextMenu(responseArea, true);
-            JScrollPane respScroll = new JScrollPane(responseArea);
-            respScroll.setBorder(BorderFactory.createTitledBorder("Response"));
-
-            responseSearchBar = new SearchBar(responseArea, "Search response:");
+            responseEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY);
             JPanel respPanel = new JPanel(new BorderLayout());
-            respPanel.add(respScroll, BorderLayout.CENTER);
-            respPanel.add(responseSearchBar, BorderLayout.SOUTH);
+            respPanel.setBorder(BorderFactory.createTitledBorder("Response"));
+            respPanel.add(responseEditor.uiComponent(), BorderLayout.CENTER);
 
             JSplitPane mainSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT, reqPanel, respPanel);
             mainSplit.setResizeWeight(0.5);
@@ -1476,7 +1625,7 @@ public class VerbTamper implements BurpExtension {
                 lastSelectedVerbIndex = verbCombo.getSelectedIndex();
                 String text = requestArea.getText();
                 if (text.isEmpty() || text.startsWith("Right-click")) return;
-                String updated = swapMethod(text, selected);
+                String updated = transformRequestMethod(text, selected);
                 int caret = requestArea.getCaretPosition();
                 requestArea.setText(updated);
                 requestArea.setCaretPosition(Math.min(caret, updated.length()));
@@ -1497,7 +1646,9 @@ public class VerbTamper implements BurpExtension {
             clearBtn.addActionListener(e -> {
                 requestArea.setText("");
                 requestArea.setForeground(UIManager.getColor("TextArea.foreground"));
-                responseArea.setText("");
+                updateResponseView(null, null);
+                lastResponse = null;
+                currentResponse = null;
                 statusLabel.setText(" ");
                 sendBtn.setEnabled(false);
                 scanBtn.setEnabled(false);
@@ -1526,8 +1677,7 @@ public class VerbTamper implements BurpExtension {
                 if (!text.isEmpty()) copyToClipboard(text);
             });
             copyRespBtn.addActionListener(e -> {
-                String text = responseArea.getText();
-                if (!text.isEmpty()) copyToClipboard(text);
+                if (currentResponse != null && !currentResponse.isEmpty()) copyToClipboard(currentResponse);
             });
             diffBtn.addActionListener(e -> showDiff(lastResponse, currentResponse));
             followRedirectBtn.addActionListener(e -> doFollowRedirect());
@@ -1677,7 +1827,9 @@ public class VerbTamper implements BurpExtension {
             requestArea.setForeground(UIManager.getColor("TextArea.foreground"));
             requestArea.setText(req.toString());
             requestArea.setCaretPosition(0);
-            responseArea.setText("");
+            updateResponseView(null, null);
+            lastResponse = null;
+            currentResponse = null;
             statusLabel.setText("Loaded \u2014 " + (currentService != null ? currentService.host() : "unknown"));
             sendBtn.setEnabled(true);
             scanBtn.setEnabled(true);
@@ -1712,7 +1864,7 @@ public class VerbTamper implements BurpExtension {
             sendBtn.setEnabled(false);
             sendBtn.setText("Sending...");
             statusLabel.setText("Sending " + selectedVerb + "...");
-            responseArea.setText("");
+            updateResponseView(null, null);
 
             new Thread(() -> {
                 try {
@@ -1778,6 +1930,7 @@ public class VerbTamper implements BurpExtension {
                             + " (" + responseText.length() + " bytes)");
 
                     final HistoryEntry entry = new HistoryEntry(rawSnapshot, selectedVerb, responseText, currentService);
+                    final HttpResponse respObj = (result != null) ? result.response() : null;
 
                     SwingUtilities.invokeLater(() -> {
                         lastResponse = currentResponse;
@@ -1789,8 +1942,7 @@ public class VerbTamper implements BurpExtension {
                         }
                         history.add(entry);
                         historyIndex = history.size() - 1;
-                        responseArea.setText(responseText);
-                        responseArea.setCaretPosition(0);
+                        updateResponseView(responseText, respObj);
                         statusLabel.setText(selectedVerb + " \u2192 " + statusLine);
                         copyRespBtn.setEnabled(true);
                         repeaterBtn.setEnabled(true);
@@ -1800,7 +1952,7 @@ public class VerbTamper implements BurpExtension {
                 } catch (Exception ex) {
                     api.logging().logToError("[VerbTamper] Send failure: " + ex);
                     SwingUtilities.invokeLater(() -> {
-                        responseArea.setText("Error: " + ex.getMessage());
+                        updateResponseView("Error: " + ex.getMessage(), null);
                         statusLabel.setText("Error: " + ex.getMessage());
                     });
                 } finally {
@@ -2163,8 +2315,7 @@ public class VerbTamper implements BurpExtension {
 
                     SwingUtilities.invokeLater(() -> {
                         currentResponse = combined;
-                        responseArea.setText(combined);
-                        responseArea.setCaretPosition(responseArea.getDocument().getLength());
+                        updateResponseView(combined, null);
                         statusLabel.setText("Followed redirect \u2192 " + statusLine);
                         copyRespBtn.setEnabled(true);
                         // Re-enable in case the new response is itself a redirect.
@@ -2297,8 +2448,8 @@ public class VerbTamper implements BurpExtension {
             requestArea.setForeground(UIManager.getColor("TextArea.foreground"));
             requestArea.setText(entry.requestText);
             requestArea.setCaretPosition(0);
-            responseArea.setText(entry.responseText);
-            responseArea.setCaretPosition(0);
+            currentResponse = entry.responseText;
+            updateResponseView(entry.responseText, null);
             currentService = entry.service;
             sendBtn.setEnabled(true);
             scanBtn.setEnabled(true);
@@ -2306,6 +2457,29 @@ public class VerbTamper implements BurpExtension {
             followRedirectBtn.setEnabled(isFollowableRedirect(entry.responseText));
             navigating = false;
             updateNavButtons();
+        }
+
+        /** Updates the response editor component with the response text or direct Montoya HttpResponse object. */
+        private void updateResponseView(String text, HttpResponse directResponse) {
+            if (directResponse != null) {
+                try {
+                    responseEditor.setResponse(directResponse);
+                    return;
+                } catch (Exception ignored) {}
+            }
+            if (text == null || text.isEmpty()) {
+                try {
+                    responseEditor.setResponse(null);
+                } catch (Exception ignored) {}
+            } else {
+                try {
+                    responseEditor.setResponse(HttpResponse.httpResponse(text));
+                } catch (Exception e) {
+                    try {
+                        responseEditor.setResponse(HttpResponse.httpResponse("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n" + text));
+                    } catch (Exception ignored) {}
+                }
+            }
         }
 
         /** Read-only view of the send history, used by the Send History tab. */
@@ -2511,6 +2685,159 @@ public class VerbTamper implements BurpExtension {
             return newMethod + raw.substring(firstSpace);
         }
 
+        /**
+         * Transforms the request method. When changing from GET (with query parameters)
+         * to POST (or PUT/PATCH), automatically moves the query parameters to the body,
+         * removes the query string from the URL path, and adds/updates Content-Type and
+         * Content-Length headers. Symmetrically, when changing from POST (form data) back
+         * to GET, moves the form body back to the URL query string and removes Content-Type
+         * and Content-Length headers.
+         */
+        private String transformRequestMethod(String raw, String newMethod) {
+            if (raw == null || raw.isEmpty() || raw.startsWith("Right-click")) return raw;
+
+            // Normalize CRLF to \n; strip lone \r
+            String normalised = raw.replace("\r\n", "\n").replace("\r", "");
+            int blank = normalised.indexOf("\n\n");
+            String headerPart;
+            String bodyPart;
+            if (blank == -1) {
+                headerPart = normalised;
+                bodyPart = "";
+            } else {
+                headerPart = normalised.substring(0, blank);
+                bodyPart = normalised.substring(blank + 2);
+            }
+
+            String[] headerLines = headerPart.split("\n", -1);
+            if (headerLines.length == 0 || headerLines[0].trim().isEmpty()) {
+                return raw;
+            }
+
+            String requestLine = headerLines[0];
+            String[] parts = requestLine.split("\\s+");
+            if (parts.length < 2) {
+                return swapMethod(raw, newMethod);
+            }
+
+            String targetPath = parts[1];
+            String httpVersion = parts.length >= 3 ? parts[2] : "HTTP/1.1";
+            String newUpper = newMethod.toUpperCase(java.util.Locale.ROOT);
+
+            // Case 1: Switching from GET (or any method with query params) to POST (or PUT/PATCH/etc.)
+            if (targetPath.contains("?") && ("POST".equals(newUpper) || "PUT".equals(newUpper) || "PATCH".equals(newUpper) || newUpper.startsWith("POST"))) {
+                int qIdx = targetPath.indexOf('?');
+                String pathOnly = targetPath.substring(0, qIdx);
+                String queryParams = targetPath.substring(qIdx + 1);
+
+                if (!queryParams.isEmpty()) {
+                    String newFirstLine = newMethod + " " + pathOnly + " " + httpVersion;
+                    headerLines[0] = newFirstLine;
+
+                    String newBody = bodyPart.trim().isEmpty() ? queryParams : bodyPart;
+
+                    // Update or insert Content-Type: application/x-www-form-urlencoded
+                    boolean hasContentType = false;
+                    for (int i = 1; i < headerLines.length; i++) {
+                        if (headerLines[i].toLowerCase(java.util.Locale.ROOT).startsWith("content-type:")) {
+                            headerLines[i] = "Content-Type: application/x-www-form-urlencoded";
+                            hasContentType = true;
+                            break;
+                        }
+                    }
+
+                    List<String> updatedHeaders = new ArrayList<>();
+                    for (int i = 0; i < headerLines.length; i++) {
+                        updatedHeaders.add(headerLines[i]);
+                    }
+
+                    if (!hasContentType) {
+                        int insertIdx = -1;
+                        for (int i = 1; i < updatedHeaders.size(); i++) {
+                            if (updatedHeaders.get(i).toLowerCase(java.util.Locale.ROOT).startsWith("host:")) {
+                                insertIdx = i + 1;
+                                break;
+                            }
+                        }
+                        if (insertIdx == -1) insertIdx = updatedHeaders.size();
+                        updatedHeaders.add(insertIdx, "Content-Type: application/x-www-form-urlencoded");
+                    }
+
+                    // Calculate Content-Length in UTF-8 bytes
+                    int bodyLen = newBody.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+                    boolean hasContentLength = false;
+                    for (int i = 1; i < updatedHeaders.size(); i++) {
+                        if (updatedHeaders.get(i).toLowerCase(java.util.Locale.ROOT).startsWith("content-length:")) {
+                            updatedHeaders.set(i, "Content-Length: " + bodyLen);
+                            hasContentLength = true;
+                            break;
+                        }
+                    }
+                    if (!hasContentLength) {
+                        updatedHeaders.add("Content-Length: " + bodyLen);
+                    }
+
+                    StringBuilder sb = new StringBuilder();
+                    for (String h : updatedHeaders) {
+                        sb.append(h).append("\r\n");
+                    }
+                    sb.append("\r\n").append(newBody);
+                    return sb.toString();
+                }
+            }
+
+            // Case 2: Switching from POST (with form body) back to GET
+            if ("GET".equals(newUpper) && !bodyPart.trim().isEmpty() && !targetPath.contains("?")) {
+                String trimmedBody = bodyPart.trim();
+                boolean isFormBody = !trimmedBody.startsWith("{") && !trimmedBody.startsWith("[") && !trimmedBody.contains("\n");
+                boolean hasFormContentType = false;
+                for (int i = 1; i < headerLines.length; i++) {
+                    String lower = headerLines[i].toLowerCase(java.util.Locale.ROOT);
+                    if (lower.startsWith("content-type:") && lower.contains("x-www-form-urlencoded")) {
+                        hasFormContentType = true;
+                        break;
+                    }
+                }
+
+                if (isFormBody || hasFormContentType) {
+                    String newFirstLine = newMethod + " " + targetPath + "?" + trimmedBody + " " + httpVersion;
+                    List<String> updatedHeaders = new ArrayList<>();
+                    updatedHeaders.add(newFirstLine);
+
+                    for (int i = 1; i < headerLines.length; i++) {
+                        String line = headerLines[i];
+                        String lower = line.toLowerCase(java.util.Locale.ROOT);
+                        if (lower.startsWith("content-type:") && lower.contains("x-www-form-urlencoded")) {
+                            continue;
+                        }
+                        if (lower.startsWith("content-length:")) {
+                            continue;
+                        }
+                        updatedHeaders.add(line);
+                    }
+
+                    StringBuilder sb = new StringBuilder();
+                    for (String h : updatedHeaders) {
+                        sb.append(h).append("\r\n");
+                    }
+                    sb.append("\r\n");
+                    return sb.toString();
+                }
+            }
+
+            // Default: replace method on first line, preserve headers & body
+            headerLines[0] = newMethod + " " + targetPath + (parts.length >= 3 ? " " + httpVersion : "");
+            StringBuilder sb = new StringBuilder();
+            for (String h : headerLines) {
+                sb.append(h).append("\r\n");
+            }
+            sb.append("\r\n");
+            if (!bodyPart.isEmpty()) {
+                sb.append(bodyPart);
+            }
+            return sb.toString();
+        }
+
         /** Builds the initial list of items for the verb dropdown: the seven
          *  standard verbs followed by the "Custom..." sentinel. */
         private String[] buildInitialVerbItems() {
@@ -2574,7 +2901,7 @@ public class VerbTamper implements BurpExtension {
             // Apply the new verb to the request line, same as a normal pick.
             String text = requestArea.getText();
             if (!text.isEmpty() && !text.startsWith("Right-click")) {
-                String updated = swapMethod(text, verb);
+                String updated = transformRequestMethod(text, verb);
                 int caret = requestArea.getCaretPosition();
                 requestArea.setText(updated);
                 requestArea.setCaretPosition(Math.min(caret, updated.length()));
