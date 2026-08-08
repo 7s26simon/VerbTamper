@@ -14,6 +14,7 @@ import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import burp.api.montoya.ui.contextmenu.MessageEditorHttpRequestResponse;
 import burp.api.montoya.ui.editor.EditorOptions;
+import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
 
 import javax.swing.*;
@@ -248,22 +249,46 @@ public class VerbTamper implements BurpExtension {
             }
         });
 
-        JTextArea fullRespArea = new JTextArea();
-        fullRespArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        fullRespArea.setEditable(false);
-        fullRespArea.setBackground(new Color(28, 28, 28));
-        fullRespArea.setForeground(Color.GRAY);
-        fullRespArea.setText("Click a row above to view the full response");
-        JScrollPane fullRespScroll = new JScrollPane(fullRespArea);
-        fullRespScroll.setBorder(BorderFactory.createTitledBorder("Full Response"));
+        HttpRequestEditor scanReqEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY);
+        HttpResponseEditor scanRespEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY);
+
+        JTabbedPane detailTabs = new JTabbedPane();
+        detailTabs.addTab("Response", scanRespEditor.uiComponent());
+        detailTabs.addTab("Request", scanReqEditor.uiComponent());
+        detailTabs.setSelectedComponent(scanRespEditor.uiComponent());
 
         table.getSelectionModel().addListSelectionListener(e -> {
             if (e.getValueIsAdjusting()) return;
             int row = table.getSelectedRow();
             if (row >= 0 && row < session.records.size()) {
-                fullRespArea.setForeground(new Color(180, 255, 180));
-                fullRespArea.setText(session.records.get(row).fullResponse);
-                fullRespArea.setCaretPosition(0);
+                ScanRecord rec = session.records.get(row);
+                if (rec.fullRequest != null && !rec.fullRequest.isEmpty()) {
+                    try {
+                        if (session.service != null) {
+                            scanReqEditor.setRequest(HttpRequest.httpRequest(session.service, rec.fullRequest));
+                        } else {
+                            scanReqEditor.setRequest(HttpRequest.httpRequest(rec.fullRequest));
+                        }
+                    } catch (Exception ignored) {
+                        scanReqEditor.setRequest(null);
+                    }
+                } else {
+                    scanReqEditor.setRequest(null);
+                }
+
+                if (rec.fullResponse != null && !rec.fullResponse.isEmpty()) {
+                    try {
+                        scanRespEditor.setResponse(HttpResponse.httpResponse(rec.fullResponse));
+                    } catch (Exception ex) {
+                        try {
+                            scanRespEditor.setResponse(HttpResponse.httpResponse("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n" + rec.fullResponse));
+                        } catch (Exception ignored) {
+                            scanRespEditor.setResponse(null);
+                        }
+                    }
+                } else {
+                    scanRespEditor.setResponse(null);
+                }
             }
         });
 
@@ -307,9 +332,12 @@ public class VerbTamper implements BurpExtension {
 
         JButton copyFullBtn = new JButton("Copy Full Response");
         copyFullBtn.addActionListener(e -> {
-            String txt = fullRespArea.getText();
-            if (!txt.isEmpty() && !txt.startsWith("Click")) {
-                Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(txt), null);
+            int row = table.getSelectedRow();
+            if (row >= 0 && row < session.records.size()) {
+                String resp = session.records.get(row).fullResponse;
+                if (resp != null && !resp.isEmpty()) {
+                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(resp), null);
+                }
             }
         });
 
@@ -337,7 +365,7 @@ public class VerbTamper implements BurpExtension {
                 stopBtn.setText("Stop");
                 scanStatus.setText(n < session.expectedCount
                         ? "Scanning " + n + " / " + session.expectedCount + "..."
-                        : "Done \u2014 click any row to see the full response");
+                        : "Done \u2014 click any row to see the details");
             }
         });
 
@@ -356,29 +384,27 @@ public class VerbTamper implements BurpExtension {
         topRow.add(scanStatus, BorderLayout.CENTER);
         topRow.add(rightButtons, BorderLayout.EAST);
 
-        JSplitPane scanSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT, new JScrollPane(table), fullRespScroll);
-        scanSplit.setResizeWeight(0.5);
+        JSplitPane scanSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT, new JScrollPane(table), detailTabs);
+        scanSplit.setResizeWeight(0.45);
         scanSplit.setDividerSize(6);
-        SwingUtilities.invokeLater(() -> scanSplit.setDividerLocation(0.5));
+        SwingUtilities.invokeLater(() -> scanSplit.setDividerLocation(0.45));
 
-        JDialog dialog = new JDialog();
-        dialog.setTitle("Scan All " + session.scanType + " \u2014 " + session.displayTitle());
-        dialog.setSize(800, 600);
-        dialog.setLocationRelativeTo(null);
-        dialog.setLayout(new BorderLayout(4, 4));
-        dialog.add(topRow, BorderLayout.NORTH);
-        dialog.add(scanSplit, BorderLayout.CENTER);
-        // If the user closes the dialog mid-scan, cancel the worker so a paused
-        // (or still-running) scan thread doesn't linger in the background.
-        if (live) {
-            dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
-            dialog.addWindowListener(new java.awt.event.WindowAdapter() {
-                @Override public void windowClosing(java.awt.event.WindowEvent e) {
-                    session.cancel();
-                }
-            });
-        }
-        dialog.setVisible(true);
+        // Use a top-level JFrame so it gets its own dedicated Windows taskbar entry
+        // under the Burp Suite taskbar group.
+        JFrame frame = new JFrame();
+        frame.setTitle("Scan All " + session.scanType + " \u2014 " + session.displayTitle());
+        frame.setSize(950, 700);
+        frame.setLocationRelativeTo(null);
+        frame.setLayout(new BorderLayout(4, 4));
+        frame.add(topRow, BorderLayout.NORTH);
+        frame.add(scanSplit, BorderLayout.CENTER);
+        frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+        frame.addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowClosing(java.awt.event.WindowEvent e) {
+                if (live) session.cancel();
+            }
+        });
+        frame.setVisible(true);
 
         // Replay mode: populate table immediately from existing records.
         if (!live) {
@@ -398,7 +424,7 @@ public class VerbTamper implements BurpExtension {
                 } else if (n < session.expectedCount) {
                     scanStatus.setText("Scanning " + n + " / " + session.expectedCount + "...");
                 } else {
-                    scanStatus.setText("Done \u2014 click any row to see the full response");
+                    scanStatus.setText("Done \u2014 click any row to see details");
                     stopBtn.setText("Stop");
                     stopBtn.setEnabled(false);
                 }

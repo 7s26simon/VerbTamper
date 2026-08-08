@@ -4,6 +4,7 @@ build/
 scripts/burp/
 libs/
 .gradle/
+.vscode/
 
 # macOS
 .DS_Store
