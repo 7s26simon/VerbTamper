@@ -125,7 +125,7 @@ public class VerbTamper implements BurpExtension {
 
         api.userInterface().registerContextMenuItemsProvider(new VerbContextMenuProvider());
         this.tabRegistration = api.userInterface().registerSuiteTab("Verb Tamper", suiteTabs);
-        api.logging().logToOutput("Verb Tamper 2.1.0 loaded.");
+        api.logging().logToOutput("Verb Tamper 2.2.0 loaded.");
     }
 
     /**
@@ -1714,9 +1714,8 @@ public class VerbTamper implements BurpExtension {
             // Repeater rather than whatever was last sent.
             repeaterBtn.addActionListener(e -> {
                 if (currentService == null) return;
-                String rawText = sanitiseHeaders(requestArea.getText());
                 String verb = (String) verbCombo.getSelectedItem();
-                String updatedRaw = swapMethod(rawText, verb);
+                String updatedRaw = sanitiseHeaders(transformRequestMethod(requestArea.getText(), verb));
                 try {
                     HttpRequest req = HttpRequest.httpRequest(currentService, updatedRaw);
                     String caption = "Verb Tamper - " + verb + " #" + repeaterTabCounter.incrementAndGet();
@@ -1866,9 +1865,8 @@ public class VerbTamper implements BurpExtension {
         private void doSend() {
             if (currentService == null) return;
 
-            String rawText = sanitiseHeaders(requestArea.getText());
             String selectedVerb = (String) verbCombo.getSelectedItem();
-            final String updatedRaw = swapMethod(rawText, selectedVerb);
+            final String updatedRaw = sanitiseHeaders(transformRequestMethod(requestArea.getText(), selectedVerb));
 
             api.logging().logToOutput("[VerbTamper] Sending " + selectedVerb + " to "
                     + currentService.host() + ":" + currentService.port()
@@ -2029,7 +2027,7 @@ public class VerbTamper implements BurpExtension {
                     if (session.cancelled) break;
                     session.awaitIfPaused();
                     if (session.cancelled) break;
-                    final String verbRaw = swapMethod(rawText, verb);
+                    final String verbRaw = sanitiseHeaders(transformRequestMethod(rawText, verb));
                     ScanRecord rec;
                     try {
                         HttpRequest req = HttpRequest.httpRequest(currentService, verbRaw);
@@ -2705,6 +2703,13 @@ public class VerbTamper implements BurpExtension {
             lastSelectedVerbIndex = verbCombo.getSelectedIndex();
         }
 
+        private boolean isBodyMethod(String method) {
+            if (method == null) return false;
+            String upper = method.toUpperCase(java.util.Locale.ROOT);
+            return "POST".equals(upper) || "PUT".equals(upper) || "PATCH".equals(upper)
+                    || upper.startsWith("POST") || upper.startsWith("PUT") || upper.startsWith("PATCH");
+        }
+
         private String swapMethod(String raw, String newMethod) {
             int firstSpace = raw.indexOf(' ');
             if (firstSpace == -1) return raw;
@@ -2716,8 +2721,8 @@ public class VerbTamper implements BurpExtension {
          * to POST (or PUT/PATCH), automatically moves the query parameters to the body,
          * removes the query string from the URL path, and adds/updates Content-Type and
          * Content-Length headers. Symmetrically, when changing from POST (form data) back
-         * to GET, moves the form body back to the URL query string and removes Content-Type
-         * and Content-Length headers.
+         * to GET (or DELETE/HEAD/OPTIONS), moves the form body back to the URL query string
+         * and removes Content-Type and Content-Length headers.
          */
         private String transformRequestMethod(String raw, String newMethod) {
             if (raw == null || raw.isEmpty() || raw.startsWith("Right-click")) return raw;
@@ -2748,10 +2753,9 @@ public class VerbTamper implements BurpExtension {
 
             String targetPath = parts[1];
             String httpVersion = parts.length >= 3 ? parts[2] : "HTTP/1.1";
-            String newUpper = newMethod.toUpperCase(java.util.Locale.ROOT);
 
-            // Case 1: Switching from GET (or any method with query params) to POST (or PUT/PATCH/etc.)
-            if (targetPath.contains("?") && ("POST".equals(newUpper) || "PUT".equals(newUpper) || "PATCH".equals(newUpper) || newUpper.startsWith("POST"))) {
+            // Case 1: Switching from a query method (or URL with query params) to a body method (POST, PUT, PATCH, etc.)
+            if (targetPath.contains("?") && isBodyMethod(newMethod)) {
                 int qIdx = targetPath.indexOf('?');
                 String pathOnly = targetPath.substring(0, qIdx);
                 String queryParams = targetPath.substring(qIdx + 1);
@@ -2812,8 +2816,8 @@ public class VerbTamper implements BurpExtension {
                 }
             }
 
-            // Case 2: Switching from POST (with form body) back to GET
-            if ("GET".equals(newUpper) && !bodyPart.trim().isEmpty() && !targetPath.contains("?")) {
+            // Case 2: Switching from a body method (with form body) back to a query method (GET, DELETE, HEAD, OPTIONS, etc.)
+            if (!isBodyMethod(newMethod) && !bodyPart.trim().isEmpty() && !targetPath.contains("?")) {
                 String trimmedBody = bodyPart.trim();
                 boolean isFormBody = !trimmedBody.startsWith("{") && !trimmedBody.startsWith("[") && !trimmedBody.contains("\n");
                 boolean hasFormContentType = false;
