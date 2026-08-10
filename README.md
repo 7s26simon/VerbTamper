@@ -24,6 +24,9 @@ Send any request to VerbTamper, change the verb or inject a bypass header, and f
 - **Right-click context menu** — "Send to Verb Tamper" from Proxy history, Repeater, or anywhere else in Burp
 - **Dedicated tab with three sub-tabs** — Scanner, Send History, Scan History
 - **Live verb sync** — changing the dropdown rewrites the method in the request text in real time
+- **Parameter migration** — with **Migrate params** ticked, switching GET → POST/PUT/PATCH moves the query string into an `application/x-www-form-urlencoded` body (setting `Content-Type` and a UTF-8-correct `Content-Length`), and switching back moves it into the URL. Untick it for a bare method swap that leaves every other byte alone
+- **Native Burp viewers** — responses render in Burp's own read-only editor, so you get Pretty / Raw / Hex / Render tabs, syntax highlighting, and Burp's search for free
+- **Line numbers** — the editable request pane has a gutter
 - **Custom verbs** — pick `Custom…` from the dropdown to test non-standard verbs (`POSTX`, `PROPFIND`, `FOOBAR`, etc.); they're added to the dropdown alongside the standard seven and included in Scan All Verbs
 - **HTTP/2 aware** — automatically detects and sends HTTP/2 requests correctly
 - **Robust response handling** — reads responses via raw byte arrays with fallbacks, so HTTP/2 edge cases don't come back as empty
@@ -32,7 +35,7 @@ Send any request to VerbTamper, change the verb or inject a bypass header, and f
 
 ### Scanner tab
 
-- **Scan All Verbs** — fires all 7 standard verbs (plus any custom verb in the dropdown) in parallel and shows a colour-coded results table (status, length, preview)
+- **Scan All Verbs** — fires all 7 standard verbs (plus any custom verb in the dropdown) and shows a colour-coded results table (status, length, preview) in its own window, with Request and Response tabs for the selected row. Every row sends the editor's request byte-for-byte with only the verb changed — parameter migration is *not* applied here, so the verb stays the only variable and a 2xx/4xx split is attributable to it
 - **Bypass header dropdown** — one-click insertion of common access-control bypass headers, placed directly after the `Host:` line:
   - *Method override*: `X-HTTP-Method-Override: DELETE/PUT/PATCH`, `X-HTTP-Method`, `X-Method-Override` (also auto-switches the verb dropdown to POST)
   - *IP spoofing*: `X-Forwarded-For`, `X-Real-IP`, `X-Originating-IP`, `X-Remote-IP`, `X-Client-IP`, `X-Host`, `X-Forwarded-Host`
@@ -40,8 +43,8 @@ Send any request to VerbTamper, change the verb or inject a bypass header, and f
 - **Auth token manager** — save labelled JWTs and apply them to the current request in one click
 - **Follow Redirect** — when the response is a 3xx with a `Location` header, the button fires a fresh GET to that URL (preserving auth headers) and appends the new response below the original; works for relative or absolute Locations including cross-origin
 - **Diff view** — line-by-line diff of the last two responses, red for removed, green for added
-- **Search bars** — under each pane: type a query, hit Enter to highlight every match (yellow for all, orange for current), then ◀ / ▶ to jump between them; Esc clears
-- **Right-click → Copy URL** — copy the full URL of the current request from either pane; the response area also offers "Copy Location URL" when a redirect target is present
+- **Search bar** — under the request pane: type a query, hit Enter to highlight every match (yellow for all, orange for current), then ◀ / ▶ to jump between them; Esc clears. The response pane uses Burp's built-in editor search instead
+- **Right-click → Copy URL** — copy the full URL of the current request; the same menu offers "Copy Location URL" when the current response carries a redirect target
 - **Back / Forward navigation** — browse your send history like Repeater
 - **Send to Repeater** — reads the current dropdown and editor state every click, so you push the *intended* request (not the last one sent)
 - **Copy Req / Copy Resp / Clear** — obvious buttons; Clear also resets the verb dropdown and removes any custom verbs
@@ -74,11 +77,11 @@ Send any request to VerbTamper, change the verb or inject a bypass header, and f
 
 ### Steps
 
-1. Download `VerbTamper-2.1.0.jar` from [Releases](../../releases)
+1. Download `VerbTamper-2.2.0.jar` from [Releases](../../releases)
 2. In Burp Suite, go to **Extensions → Installed → Add**
 3. Set **Extension type** to `Java`
 4. Select the downloaded `.jar` file
-5. Click **Next** — you should see `Verb Tamper 2.1.0 loaded.` in the output
+5. Click **Next** — you should see `Verb Tamper 2.2.0 loaded.` in the output
 6. A **Verb Tamper** tab will appear in the main Burp window
 
 ---
@@ -112,7 +115,31 @@ Send any request to VerbTamper, change the verb or inject a bypass header, and f
 
 ### Search
 
-Under each pane there's a search field. Type a word and hit Enter — every match in the pane gets highlighted, and the first one at or below your caret turns orange. Use ◀ and ▶ to jump between matches; the counter shows your position (e.g. `3 / 12`). Esc clears the search.
+Under the request pane there's a search field. Type a word and hit Enter — every match in the pane gets highlighted, and the first one at or below your caret turns orange. Use ◀ and ▶ to jump between matches; the counter shows your position (e.g. `3 / 12`). Esc clears the search.
+
+The response pane is Burp's own editor, so use its built-in search box at the bottom of the pane.
+
+### Parameter migration
+
+**Migrate params** (ticked by default, next to the verb dropdown) keeps parameters in the right place for the verb you pick:
+
+```
+# GET with a query string...
+GET /api/search?q=admin&page=2 HTTP/1.1
+Host: target.example.com
+
+# ...becomes, on switching to POST:
+POST /api/search HTTP/1.1
+Host: target.example.com
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 20
+
+q=admin&page=2
+```
+
+Switching back to GET/DELETE/HEAD/OPTIONS reverses it. Migration only happens when it's unambiguous: a JSON or multipart body is left alone (and the query string stays on the URL rather than being dropped), and custom verbs like `POSTX` always get a plain method swap since there's no way to know whether they take a body.
+
+Untick the box when you want byte-exact control over the request. **Scan All Verbs ignores this setting entirely** and always sends identical bytes with only the verb swapped.
 
 ### Follow Redirect
 
@@ -156,32 +183,17 @@ Authorization: Bearer <user-token>
 
 ## Building from source
 
-Requires JDK 11+ and Gradle. You'll need to supply the Montoya API by extracting it from your local Burp jar:
+Requires JDK 11+ and Gradle. You'll need to supply the Montoya API by extracting it from your local Burp jar — `scripts/extract-local-montoya.py` does that for you:
 
 ```bash
-# Extract the Montoya API classes from your Burp installation
-python3 -c "
-import zipfile
-with zipfile.ZipFile('/path/to/burpsuite.jar') as z:
-    for f in z.namelist():
-        if f.startswith('burp/api/'):
-            z.extract(f, '.')
-"
-
-# Package into a jar
-python3 -c "
-import zipfile, os
-with zipfile.ZipFile('libs/montoya-api-real.jar', 'w') as z:
-    for root, dirs, files in os.walk('burp/'):
-        for f in files:
-            path = os.path.join(root, f)
-            z.write(path)
-"
+# Finds burpsuite.jar in the usual install locations and writes
+# libs/montoya-api-real.jar. Pass the path explicitly if it can't find it.
+python3 scripts/extract-local-montoya.py
 
 # Build
 gradle jar
 
-# Output: build/libs/VerbTamper-2.1.0.jar
+# Output: build/libs/VerbTamper-2.2.0.jar
 ```
 
 > **Why not Maven Central?** The Montoya API jar on Maven Central may not match the exact version bundled with your Burp installation, causing `NoSuchMethodError` at runtime. Extracting directly from your Burp jar guarantees compatibility.

@@ -424,7 +424,7 @@ public class VerbTamper implements BurpExtension {
                 } else if (n < session.expectedCount) {
                     scanStatus.setText("Scanning " + n + " / " + session.expectedCount + "...");
                 } else {
-                    scanStatus.setText("Done \u2014 click any row to see details");
+                    scanStatus.setText("Done \u2014 click any row to see the details");
                     stopBtn.setText("Stop");
                     stopBtn.setEnabled(false);
                 }
@@ -1455,6 +1455,7 @@ public class VerbTamper implements BurpExtension {
         private final JButton copyRespBtn;
         private final JButton diffBtn;
         private final JButton followRedirectBtn;
+        private final JCheckBox migrateParamsChk;
         private final JLabel statusLabel;
         private final JLabel historyLabel;
 
@@ -1489,7 +1490,7 @@ public class VerbTamper implements BurpExtension {
             requestArea.setLineWrap(false);
             requestArea.setText("Right-click any request in Burp and choose \"Send to Verb Tamper\"");
             requestArea.setForeground(Color.GRAY);
-            attachUrlContextMenu(requestArea, false);
+            attachUrlContextMenu(requestArea, true);
             JScrollPane reqScroll = new JScrollPane(requestArea);
             reqScroll.setRowHeaderView(new TextLineNumber(requestArea));
             reqScroll.setBorder(BorderFactory.createTitledBorder("Request (editable)"));
@@ -1554,7 +1555,8 @@ public class VerbTamper implements BurpExtension {
             sendBtn.setEnabled(false);
 
             scanBtn = new JButton("Scan All \u25BE");
-            scanBtn.setToolTipText("Choose a scan: all verbs, or all bypass headers (GET only)");
+            scanBtn.setToolTipText("<html>Choose a scan: all verbs, or all bypass headers (GET only).<br>"
+                    + "Every row sends the editor's request byte-for-byte with only the verb changed.</html>");
             scanBtn.setBackground(new Color(70, 100, 180));
             scanBtn.setForeground(Color.WHITE);
             scanBtn.setOpaque(true);
@@ -1578,6 +1580,12 @@ public class VerbTamper implements BurpExtension {
             copyRespBtn = new JButton("Copy Resp");
             copyRespBtn.setEnabled(false);
 
+            migrateParamsChk = new JCheckBox("Migrate params", true);
+            migrateParamsChk.setToolTipText("<html>When the verb changes, move parameters between the query string "
+                    + "and a form body:<br>GET <code>?a=1</code> &rarr; POST body, and back again.<br>"
+                    + "Applies to the editor, Send and Send to Repeater. "
+                    + "<b>Scan All Verbs always sends byte-identical requests</b> regardless of this setting.</html>");
+
             statusLabel = new JLabel(" ");
             statusLabel.setForeground(Color.GRAY);
 
@@ -1588,6 +1596,7 @@ public class VerbTamper implements BurpExtension {
             toolbar.add(makeSep());
             toolbar.add(new JLabel("Verb:"));
             toolbar.add(verbCombo);
+            toolbar.add(migrateParamsChk);
             toolbar.add(sendBtn);
             toolbar.add(scanBtn);
             toolbar.add(repeaterBtn);
@@ -1651,7 +1660,7 @@ public class VerbTamper implements BurpExtension {
                 lastSelectedVerbIndex = verbCombo.getSelectedIndex();
                 String text = requestArea.getText();
                 if (text.isEmpty() || text.startsWith("Right-click")) return;
-                String updated = transformRequestMethod(text, selected);
+                String updated = applyVerb(text, selected);
                 int caret = requestArea.getCaretPosition();
                 requestArea.setText(updated);
                 requestArea.setCaretPosition(Math.min(caret, updated.length()));
@@ -1715,7 +1724,7 @@ public class VerbTamper implements BurpExtension {
             repeaterBtn.addActionListener(e -> {
                 if (currentService == null) return;
                 String verb = (String) verbCombo.getSelectedItem();
-                String updatedRaw = sanitiseHeaders(transformRequestMethod(requestArea.getText(), verb));
+                String updatedRaw = sanitiseHeaders(applyVerb(requestArea.getText(), verb));
                 try {
                     HttpRequest req = HttpRequest.httpRequest(currentService, updatedRaw);
                     String caption = "Verb Tamper - " + verb + " #" + repeaterTabCounter.incrementAndGet();
@@ -1866,7 +1875,7 @@ public class VerbTamper implements BurpExtension {
             if (currentService == null) return;
 
             String selectedVerb = (String) verbCombo.getSelectedItem();
-            final String updatedRaw = sanitiseHeaders(transformRequestMethod(requestArea.getText(), selectedVerb));
+            final String updatedRaw = sanitiseHeaders(applyVerb(requestArea.getText(), selectedVerb));
 
             api.logging().logToOutput("[VerbTamper] Sending " + selectedVerb + " to "
                     + currentService.host() + ":" + currentService.port()
@@ -2027,7 +2036,13 @@ public class VerbTamper implements BurpExtension {
                     if (session.cancelled) break;
                     session.awaitIfPaused();
                     if (session.cancelled) break;
-                    final String verbRaw = sanitiseHeaders(transformRequestMethod(rawText, verb));
+                    // Deliberately a bare method swap, not applyVerb(). The whole point
+                    // of this scan is that the verb is the only variable: if POST got
+                    // its parameters relocated into a body while GET kept them in the
+                    // query string, a 200-vs-405 split in the results table would no
+                    // longer isolate the verb as the cause. Whatever is in the editor
+                    // -- migrated or not -- is what every row sends.
+                    final String verbRaw = swapMethod(rawText, verb);
                     ScanRecord rec;
                     try {
                         HttpRequest req = HttpRequest.httpRequest(currentService, verbRaw);
@@ -2597,13 +2612,16 @@ public class VerbTamper implements BurpExtension {
         }
 
         /**
-         * Attach a "Copy URL" right-click menu to a JTextArea. For the response
-         * area, also adds a "Copy Location URL" item enabled only when the
-         * current response has a Location header. Standard editor actions
-         * (Cut/Copy/Paste/Select All) are added below as a separator group so
-         * the new menu replaces, rather than competes with, the native one.
+         * Attach a "Copy URL" right-click menu to a JTextArea. Standard editor
+         * actions (Cut/Copy/Paste/Select All) are added below as a separator group
+         * so the new menu replaces, rather than competes with, the native one.
+         *
+         * {@code includeLocationItem} adds "Copy Location URL", enabled only when
+         * the current response has a Location header. That item used to live on the
+         * response pane's own context menu; the response pane is now Burp's native
+         * editor and can't carry one, so it hangs off this menu instead.
          */
-        private void attachUrlContextMenu(JTextArea area, boolean isResponse) {
+        private void attachUrlContextMenu(JTextArea area, boolean includeLocationItem) {
             JPopupMenu menu = new JPopupMenu();
 
             JMenuItem copyUrlItem = new JMenuItem("Copy URL");
@@ -2619,7 +2637,7 @@ public class VerbTamper implements BurpExtension {
             menu.add(copyUrlItem);
 
             final JMenuItem copyLocationItem;
-            if (isResponse) {
+            if (includeLocationItem) {
                 copyLocationItem = new JMenuItem("Copy Location URL");
                 copyLocationItem.addActionListener(e -> {
                     String url = currentLocationUrl();
@@ -2703,17 +2721,39 @@ public class VerbTamper implements BurpExtension {
             lastSelectedVerbIndex = verbCombo.getSelectedIndex();
         }
 
+        /** Shape of an application/x-www-form-urlencoded body: k=v pairs, no whitespace.
+         *  Values may themselves contain '=' since servers commonly leave it unencoded. */
+        private final java.util.regex.Pattern formBodyPattern =
+                java.util.regex.Pattern.compile("[^&\\s=]+=[^&\\s]*(?:&[^&\\s=]+=[^&\\s]*)*");
+
+        /**
+         * Whether a verb carries its parameters in the body. Deliberately an exact
+         * match: a custom verb like POSTX or PUTFOO is an unknown quantity, and
+         * silently restructuring a request for it would be a guess, so those fall
+         * through to a plain method swap.
+         */
         private boolean isBodyMethod(String method) {
             if (method == null) return false;
-            String upper = method.toUpperCase(java.util.Locale.ROOT);
-            return "POST".equals(upper) || "PUT".equals(upper) || "PATCH".equals(upper)
-                    || upper.startsWith("POST") || upper.startsWith("PUT") || upper.startsWith("PATCH");
+            String upper = method.trim().toUpperCase(java.util.Locale.ROOT);
+            return "POST".equals(upper) || "PUT".equals(upper) || "PATCH".equals(upper);
         }
 
         private String swapMethod(String raw, String newMethod) {
             int firstSpace = raw.indexOf(' ');
             if (firstSpace == -1) return raw;
             return newMethod + raw.substring(firstSpace);
+        }
+
+        /**
+         * Applies a verb the way the user has asked for it: with parameter migration
+         * when the "Migrate params" box is ticked, otherwise a bare method swap that
+         * leaves every other byte alone. Scan All deliberately does not go through
+         * here -- see {@link #doScan()}.
+         */
+        private String applyVerb(String raw, String newMethod) {
+            return migrateParamsChk.isSelected()
+                    ? transformRequestMethod(raw, newMethod)
+                    : swapMethod(raw, newMethod);
         }
 
         /**
@@ -2760,11 +2800,24 @@ public class VerbTamper implements BurpExtension {
                 String pathOnly = targetPath.substring(0, qIdx);
                 String queryParams = targetPath.substring(qIdx + 1);
 
+                // Work out what the body becomes. The query string is only safe to
+                // strip off the path once we know where it has gone -- if there is
+                // already a body we can't merge into (JSON, multipart, anything not
+                // form-encoded), we leave the URL alone and fall through to a plain
+                // method swap rather than dropping the parameters on the floor.
+                String existingBody = bodyPart.trim();
+                String newBody = null;
                 if (!queryParams.isEmpty()) {
+                    if (existingBody.isEmpty()) {
+                        newBody = queryParams;
+                    } else if (formBodyPattern.matcher(existingBody).matches()) {
+                        newBody = existingBody + "&" + queryParams;
+                    }
+                }
+
+                if (newBody != null) {
                     String newFirstLine = newMethod + " " + pathOnly + " " + httpVersion;
                     headerLines[0] = newFirstLine;
-
-                    String newBody = bodyPart.trim().isEmpty() ? queryParams : bodyPart;
 
                     // Update or insert Content-Type: application/x-www-form-urlencoded
                     boolean hasContentType = false;
@@ -2819,17 +2872,13 @@ public class VerbTamper implements BurpExtension {
             // Case 2: Switching from a body method (with form body) back to a query method (GET, DELETE, HEAD, OPTIONS, etc.)
             if (!isBodyMethod(newMethod) && !bodyPart.trim().isEmpty() && !targetPath.contains("?")) {
                 String trimmedBody = bodyPart.trim();
-                boolean isFormBody = !trimmedBody.startsWith("{") && !trimmedBody.startsWith("[") && !trimmedBody.contains("\n");
-                boolean hasFormContentType = false;
-                for (int i = 1; i < headerLines.length; i++) {
-                    String lower = headerLines[i].toLowerCase(java.util.Locale.ROOT);
-                    if (lower.startsWith("content-type:") && lower.contains("x-www-form-urlencoded")) {
-                        hasFormContentType = true;
-                        break;
-                    }
-                }
 
-                if (isFormBody || hasFormContentType) {
+                // Only promote a body to the query string when it actually looks like
+                // form data -- k=v pairs with no whitespace. A looser check (anything
+                // that isn't JSON) would paste raw bodies into the request line, and
+                // we can't URL-encode our way out of that: a form body is already
+                // percent-encoded, so encoding it again would corrupt it.
+                if (formBodyPattern.matcher(trimmedBody).matches()) {
                     String newFirstLine = newMethod + " " + targetPath + "?" + trimmedBody + " " + httpVersion;
                     List<String> updatedHeaders = new ArrayList<>();
                     updatedHeaders.add(newFirstLine);
@@ -2931,7 +2980,7 @@ public class VerbTamper implements BurpExtension {
             // Apply the new verb to the request line, same as a normal pick.
             String text = requestArea.getText();
             if (!text.isEmpty() && !text.startsWith("Right-click")) {
-                String updated = transformRequestMethod(text, verb);
+                String updated = applyVerb(text, verb);
                 int caret = requestArea.getCaretPosition();
                 requestArea.setText(updated);
                 requestArea.setCaretPosition(Math.min(caret, updated.length()));
