@@ -1456,6 +1456,7 @@ public class VerbTamper implements BurpExtension {
         private final JButton diffBtn;
         private final JButton followRedirectBtn;
         private final JCheckBox migrateParamsChk;
+        private final JCheckBox duplicateParamsChk;
         private final JLabel statusLabel;
         private final JLabel historyLabel;
 
@@ -1586,6 +1587,33 @@ public class VerbTamper implements BurpExtension {
                     + "Applies to the editor, Send and Send to Repeater. "
                     + "<b>Scan All Verbs always sends byte-identical requests</b> regardless of this setting.</html>");
 
+            duplicateParamsChk = new JCheckBox("Duplicate params", false);
+            duplicateParamsChk.setEnabled(false);
+            duplicateParamsChk.setToolTipText("<html>When suitable parameters exist (form data k=v pairs), include them "
+                    + "both in the URL query string and in the request body.<br>"
+                    + "Applies to the editor, Send and Send to Repeater. "
+                    + "<b>Scan All Verbs always sends byte-identical requests</b> regardless of this setting.</html>");
+
+            migrateParamsChk.addActionListener(e -> {
+                if (migrateParamsChk.isSelected()) {
+                    duplicateParamsChk.setSelected(false);
+                    duplicateParamsChk.setEnabled(false);
+                } else {
+                    duplicateParamsChk.setEnabled(true);
+                }
+                reapplyCurrentVerb();
+            });
+
+            duplicateParamsChk.addActionListener(e -> {
+                if (duplicateParamsChk.isSelected()) {
+                    migrateParamsChk.setSelected(false);
+                    migrateParamsChk.setEnabled(false);
+                } else {
+                    migrateParamsChk.setEnabled(true);
+                }
+                reapplyCurrentVerb();
+            });
+
             statusLabel = new JLabel(" ");
             statusLabel.setForeground(Color.GRAY);
 
@@ -1597,6 +1625,7 @@ public class VerbTamper implements BurpExtension {
             toolbar.add(new JLabel("Verb:"));
             toolbar.add(verbCombo);
             toolbar.add(migrateParamsChk);
+            toolbar.add(duplicateParamsChk);
             toolbar.add(sendBtn);
             toolbar.add(scanBtn);
             toolbar.add(repeaterBtn);
@@ -2744,16 +2773,33 @@ public class VerbTamper implements BurpExtension {
             return newMethod + raw.substring(firstSpace);
         }
 
+        private void reapplyCurrentVerb() {
+            if (loading || navigating) return;
+            String selected = (String) verbCombo.getSelectedItem();
+            if (selected == null || CUSTOM_VERB_LABEL.equals(selected)) return;
+            String text = requestArea.getText();
+            if (text.isEmpty() || text.startsWith("Right-click")) return;
+            String updated = applyVerb(text, selected);
+            int caret = requestArea.getCaretPosition();
+            requestArea.setText(updated);
+            requestArea.setCaretPosition(Math.min(caret, updated.length()));
+        }
+
         /**
          * Applies a verb the way the user has asked for it: with parameter migration
-         * when the "Migrate params" box is ticked, otherwise a bare method swap that
+         * when the "Migrate params" box is ticked, parameter duplication (both URL & body)
+         * when "Duplicate params" is ticked, otherwise a bare method swap that
          * leaves every other byte alone. Scan All deliberately does not go through
          * here -- see {@link #doScan()}.
          */
         private String applyVerb(String raw, String newMethod) {
-            return migrateParamsChk.isSelected()
-                    ? transformRequestMethod(raw, newMethod)
-                    : swapMethod(raw, newMethod);
+            if (migrateParamsChk.isSelected()) {
+                return transformRequestMethod(raw, newMethod);
+            } else if (duplicateParamsChk.isSelected()) {
+                return duplicateParamsRequestMethod(raw, newMethod);
+            } else {
+                return swapMethod(raw, newMethod);
+            }
         }
 
         /**
@@ -2915,6 +2961,139 @@ public class VerbTamper implements BurpExtension {
                 sb.append(bodyPart);
             }
             return sb.toString();
+        }
+
+        /**
+         * Duplicates suitable form parameters (k=v pairs, no whitespace) so that they
+         * appear both in the URL query string and in the request body.
+         * Updates/adds Content-Type and Content-Length headers for the body.
+         */
+        private String duplicateParamsRequestMethod(String raw, String newMethod) {
+            if (raw == null || raw.isEmpty() || raw.startsWith("Right-click")) return raw;
+
+            // Normalize CRLF to \n; strip lone \r
+            String normalised = raw.replace("\r\n", "\n").replace("\r", "");
+            int blank = normalised.indexOf("\n\n");
+            String headerPart;
+            String bodyPart;
+            if (blank == -1) {
+                headerPart = normalised;
+                bodyPart = "";
+            } else {
+                headerPart = normalised.substring(0, blank);
+                bodyPart = normalised.substring(blank + 2);
+            }
+
+            String[] headerLines = headerPart.split("\n", -1);
+            if (headerLines.length == 0 || headerLines[0].trim().isEmpty()) {
+                return raw;
+            }
+
+            String requestLine = headerLines[0];
+            String[] parts = requestLine.split("\\s+");
+            if (parts.length < 2) {
+                return swapMethod(raw, newMethod);
+            }
+
+            String targetPath = parts[1];
+            String httpVersion = parts.length >= 3 ? parts[2] : "HTTP/1.1";
+
+            String pathOnly = targetPath;
+            String queryParams = null;
+            if (targetPath.contains("?")) {
+                int qIdx = targetPath.indexOf('?');
+                pathOnly = targetPath.substring(0, qIdx);
+                queryParams = targetPath.substring(qIdx + 1);
+            }
+
+            String existingBody = bodyPart.trim();
+            boolean queryIsForm = queryParams != null && !queryParams.isEmpty() && formBodyPattern.matcher(queryParams).matches();
+            boolean bodyIsForm = !existingBody.isEmpty() && formBodyPattern.matcher(existingBody).matches();
+
+            // If existing body is non-empty and NOT form data (e.g. JSON, XML), don't corrupt it
+            if (!existingBody.isEmpty() && !bodyIsForm) {
+                return swapMethod(raw, newMethod);
+            }
+
+            // If query params are present but not form-shaped, don't corrupt them
+            if (queryParams != null && !queryParams.isEmpty() && !queryIsForm) {
+                return swapMethod(raw, newMethod);
+            }
+
+            // Determine the duplicated parameter string
+            String finalParams = null;
+            if (queryIsForm && bodyIsForm) {
+                finalParams = mergeParams(queryParams, existingBody);
+            } else if (queryIsForm) {
+                finalParams = queryParams;
+            } else if (bodyIsForm) {
+                finalParams = existingBody;
+            }
+
+            // If no suitable parameters exist in either query or body, fall back to plain method swap
+            if (finalParams == null || finalParams.isEmpty()) {
+                return swapMethod(raw, newMethod);
+            }
+
+            String newFirstLine = newMethod + " " + pathOnly + "?" + finalParams + " " + httpVersion;
+            headerLines[0] = newFirstLine;
+
+            // Update or insert Content-Type: application/x-www-form-urlencoded
+            boolean hasContentType = false;
+            for (int i = 1; i < headerLines.length; i++) {
+                if (headerLines[i].toLowerCase(java.util.Locale.ROOT).startsWith("content-type:")) {
+                    headerLines[i] = "Content-Type: application/x-www-form-urlencoded";
+                    hasContentType = true;
+                    break;
+                }
+            }
+
+            List<String> updatedHeaders = new ArrayList<>();
+            for (int i = 0; i < headerLines.length; i++) {
+                updatedHeaders.add(headerLines[i]);
+            }
+
+            if (!hasContentType) {
+                int insertIdx = -1;
+                for (int i = 1; i < updatedHeaders.size(); i++) {
+                    if (updatedHeaders.get(i).toLowerCase(java.util.Locale.ROOT).startsWith("host:")) {
+                        insertIdx = i + 1;
+                        break;
+                    }
+                }
+                if (insertIdx == -1) insertIdx = updatedHeaders.size();
+                updatedHeaders.add(insertIdx, "Content-Type: application/x-www-form-urlencoded");
+            }
+
+            // Calculate Content-Length in UTF-8 bytes
+            int bodyLen = finalParams.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+            boolean hasContentLength = false;
+            for (int i = 1; i < updatedHeaders.size(); i++) {
+                if (updatedHeaders.get(i).toLowerCase(java.util.Locale.ROOT).startsWith("content-length:")) {
+                    updatedHeaders.set(i, "Content-Length: " + bodyLen);
+                    hasContentLength = true;
+                    break;
+                }
+            }
+            if (!hasContentLength) {
+                updatedHeaders.add("Content-Length: " + bodyLen);
+            }
+
+            StringBuilder sb = new StringBuilder();
+            for (String h : updatedHeaders) {
+                sb.append(h).append("\r\n");
+            }
+            sb.append("\r\n").append(finalParams);
+            return sb.toString();
+        }
+
+        private String mergeParams(String queryParams, String bodyParams) {
+            if (queryParams == null || queryParams.isEmpty()) return bodyParams;
+            if (bodyParams == null || bodyParams.isEmpty()) return queryParams;
+            if (queryParams.equals(bodyParams)) return queryParams;
+            if (queryParams.contains(bodyParams)) return queryParams;
+            if (bodyParams.contains(queryParams)) return bodyParams;
+            return queryParams + "&" + bodyParams;
         }
 
         /** Builds the initial list of items for the verb dropdown: the seven

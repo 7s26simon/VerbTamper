@@ -24,7 +24,10 @@ Send any request to VerbTamper, change the verb or inject a bypass header, and f
 - **Right-click context menu** — "Send to Verb Tamper" from Proxy history, Repeater, or anywhere else in Burp
 - **Dedicated tab with three sub-tabs** — Scanner, Send History, Scan History
 - **Live verb sync** — changing the dropdown rewrites the method in the request text in real time
-- **Parameter migration** — with **Migrate params** ticked, switching GET → POST/PUT/PATCH moves the query string into an `application/x-www-form-urlencoded` body (setting `Content-Type` and a UTF-8-correct `Content-Length`), and switching back moves it into the URL. Untick it for a bare method swap that leaves every other byte alone
+- **Parameter migration & duplication** — 
+  - **Migrate params**: moving parameters between query string and `application/x-www-form-urlencoded` body when switching methods (GET ↔ POST/PUT/PATCH), setting `Content-Type` and correct `Content-Length`.
+  - **Duplicate params**: replicates suitable form parameters (`k=v` pairs) so they appear simultaneously in both the URL query string and the request body, useful for HPP / dual-parameter parser testing.
+  - The two checkboxes are mutually exclusive; unticking both allows bare method swapping leaving all parameters and body untouched.
 - **Native Burp viewers** — responses render in Burp's own read-only editor, so you get Pretty / Raw / Hex / Render tabs, syntax highlighting, and Burp's search for free
 - **Line numbers** — the editable request pane has a gutter
 - **Custom verbs** — pick `Custom…` from the dropdown to test non-standard verbs (`POSTX`, `PROPFIND`, `FOOBAR`, etc.); they're added to the dropdown alongside the standard seven and included in Scan All Verbs
