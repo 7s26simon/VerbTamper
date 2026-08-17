@@ -24,7 +24,10 @@ Send any request to VerbTamper, change the verb or inject a bypass header, and f
 - **Right-click context menu** — "Send to Verb Tamper" from Proxy history, Repeater, or anywhere else in Burp
 - **Dedicated tab with three sub-tabs** — Scanner, Send History, Scan History
 - **Live verb sync** — changing the dropdown rewrites the method in the request text in real time
-- **Parameter migration** — with **Migrate params** ticked, switching GET → POST/PUT/PATCH moves the query string into an `application/x-www-form-urlencoded` body (setting `Content-Type` and a UTF-8-correct `Content-Length`), and switching back moves it into the URL. Untick it for a bare method swap that leaves every other byte alone
+- **Parameter handling** — a three-way **Params** control next to the verb dropdown decides what happens to parameters when the verb changes:
+  - **Migrate** (default): moves parameters between the query string and an `application/x-www-form-urlencoded` body when switching GET ↔ POST/PUT/PATCH, setting `Content-Type` and a UTF-8-correct `Content-Length`
+  - **Duplicate**: copies form parameters (`k=v` pairs) so they appear in *both* the query string and the body, for HTTP Parameter Pollution and parser-differential testing
+  - **Leave**: bare method swap — the verb changes and nothing else does
 - **Native Burp viewers** — responses render in Burp's own read-only editor, so you get Pretty / Raw / Hex / Render tabs, syntax highlighting, and Burp's search for free
 - **Line numbers** — the editable request pane has a gutter
 - **Custom verbs** — pick `Custom…` from the dropdown to test non-standard verbs (`POSTX`, `PROPFIND`, `FOOBAR`, etc.); they're added to the dropdown alongside the standard seven and included in Scan All Verbs
@@ -35,7 +38,7 @@ Send any request to VerbTamper, change the verb or inject a bypass header, and f
 
 ### Scanner tab
 
-- **Scan All Verbs** — fires all 7 standard verbs (plus any custom verb in the dropdown) and shows a colour-coded results table (status, length, preview) in its own window, with Request and Response tabs for the selected row. Every row sends the editor's request byte-for-byte with only the verb changed — parameter migration is *not* applied here, so the verb stays the only variable and a 2xx/4xx split is attributable to it
+- **Scan All Verbs** — fires all 7 standard verbs (plus any custom verb in the dropdown) and shows a colour-coded results table (status, length, preview) in its own window, with Request and Response tabs for the selected row. Every row sends the editor's request byte-for-byte with only the verb changed — the **Params** control is *not* applied here, so the verb stays the only variable and a 2xx/4xx split is attributable to it
 - **Bypass header dropdown** — one-click insertion of common access-control bypass headers, placed directly after the `Host:` line:
   - *Method override*: `X-HTTP-Method-Override: DELETE/PUT/PATCH`, `X-HTTP-Method`, `X-Method-Override` (also auto-switches the verb dropdown to POST)
   - *IP spoofing*: `X-Forwarded-For`, `X-Real-IP`, `X-Originating-IP`, `X-Remote-IP`, `X-Client-IP`, `X-Host`, `X-Forwarded-Host`
@@ -119,9 +122,13 @@ Under the request pane there's a search field. Type a word and hit Enter — eve
 
 The response pane is Burp's own editor, so use its built-in search box at the bottom of the pane.
 
-### Parameter migration
+### Parameter handling
 
-**Migrate params** (ticked by default, next to the verb dropdown) keeps parameters in the right place for the verb you pick:
+The **Params** control next to the verb dropdown has three modes: **Migrate** (default), **Duplicate**, and **Leave**.
+
+#### Migrate
+
+Keeps parameters in the right place for the verb you pick:
 
 ```
 # GET with a query string...
@@ -139,7 +146,36 @@ q=admin&page=2
 
 Switching back to GET/DELETE/HEAD/OPTIONS reverses it. Migration only happens when it's unambiguous: a JSON or multipart body is left alone (and the query string stays on the URL rather than being dropped), and custom verbs like `POSTX` always get a plain method swap since there's no way to know whether they take a body.
 
-Untick the box when you want byte-exact control over the request. **Scan All Verbs ignores this setting entirely** and always sends identical bytes with only the verb swapped.
+#### Duplicate
+
+Puts the same parameters in **both** places at once, so you can see which one the target actually honours — the classic HTTP Parameter Pollution test for a front end and back end that disagree:
+
+```
+# Query says one thing, body says another...
+POST /api/account?role=user HTTP/1.1
+Host: target.example.com
+Content-Type: application/x-www-form-urlencoded
+
+role=admin
+
+# ...becomes, with Duplicate selected:
+POST /api/account?role=user&role=admin HTTP/1.1
+Host: target.example.com
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 25
+
+role=user&role=admin
+```
+
+Parameters are compared pair by pair, so same-key-different-value pairs both survive — that's the whole point of the test. Only an exact duplicate of a complete `k=v` pair is collapsed. A JSON or multipart body, or a query string that isn't form-shaped, is left alone rather than corrupted.
+
+Note that Duplicate always writes a body, including for GET, HEAD and DELETE. A GET with a body is deliberate here — it's a legitimate parser-differential probe — but be aware some intermediaries strip or reject it.
+
+#### Leave
+
+A bare method swap with byte-exact control: the verb changes and every other byte stays as-is.
+
+**Scan All Verbs ignores this control entirely** and always sends identical bytes with only the verb swapped, so the verb remains the only variable across the results table.
 
 ### Follow Redirect
 

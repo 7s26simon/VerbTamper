@@ -1455,7 +1455,9 @@ public class VerbTamper implements BurpExtension {
         private final JButton copyRespBtn;
         private final JButton diffBtn;
         private final JButton followRedirectBtn;
-        private final JCheckBox migrateParamsChk;
+        private final JRadioButton migrateParamsRadio;
+        private final JRadioButton duplicateParamsRadio;
+        private final JRadioButton leaveParamsRadio;
         private final JLabel statusLabel;
         private final JLabel historyLabel;
 
@@ -1580,11 +1582,42 @@ public class VerbTamper implements BurpExtension {
             copyRespBtn = new JButton("Copy Resp");
             copyRespBtn.setEnabled(false);
 
-            migrateParamsChk = new JCheckBox("Migrate params", true);
-            migrateParamsChk.setToolTipText("<html>When the verb changes, move parameters between the query string "
-                    + "and a form body:<br>GET <code>?a=1</code> &rarr; POST body, and back again.<br>"
-                    + "Applies to the editor, Send and Send to Repeater. "
-                    + "<b>Scan All Verbs always sends byte-identical requests</b> regardless of this setting.</html>");
+            // Migrate / Duplicate / Leave alone are three mutually exclusive states,
+            // so they're a radio group rather than checkboxes that disable each
+            // other -- with two checkboxes, the default (Migrate ticked) leaves
+            // Duplicate greyed out, and reaching it takes two clicks through a
+            // state nobody wants to stop at.
+            String scanNote = "<br>Applies to the editor, Send and Send to Repeater. "
+                    + "<b>Scan All Verbs always sends byte-identical requests</b> regardless of this setting.</html>";
+
+            migrateParamsRadio = new JRadioButton("Migrate", true);
+            migrateParamsRadio.setToolTipText("<html>When the verb changes, move parameters between the query string "
+                    + "and a form body:<br>GET <code>?a=1</code> &rarr; POST body, and back again." + scanNote);
+
+            duplicateParamsRadio = new JRadioButton("Duplicate", false);
+            duplicateParamsRadio.setToolTipText("<html>Copy form parameters (<code>k=v</code> pairs) into <i>both</i> the "
+                    + "query string and the body, for HPP / parser-differential testing.<br>"
+                    + "Same-key-different-value pairs are both kept." + scanNote);
+
+            leaveParamsRadio = new JRadioButton("Leave", false);
+            leaveParamsRadio.setToolTipText("<html>Bare method swap: change the verb and nothing else, "
+                    + "leaving parameters, headers and body byte-for-byte as they are." + scanNote);
+
+            ButtonGroup paramsGroup = new ButtonGroup();
+            paramsGroup.add(migrateParamsRadio);
+            paramsGroup.add(duplicateParamsRadio);
+            paramsGroup.add(leaveParamsRadio);
+
+            ActionListener paramsModeListener = e -> reapplyCurrentVerb();
+            migrateParamsRadio.addActionListener(paramsModeListener);
+            duplicateParamsRadio.addActionListener(paramsModeListener);
+            leaveParamsRadio.addActionListener(paramsModeListener);
+
+            JPanel paramsModePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 0));
+            paramsModePanel.add(new JLabel("Params:"));
+            paramsModePanel.add(migrateParamsRadio);
+            paramsModePanel.add(duplicateParamsRadio);
+            paramsModePanel.add(leaveParamsRadio);
 
             statusLabel = new JLabel(" ");
             statusLabel.setForeground(Color.GRAY);
@@ -1596,7 +1629,7 @@ public class VerbTamper implements BurpExtension {
             toolbar.add(makeSep());
             toolbar.add(new JLabel("Verb:"));
             toolbar.add(verbCombo);
-            toolbar.add(migrateParamsChk);
+            toolbar.add(paramsModePanel);
             toolbar.add(sendBtn);
             toolbar.add(scanBtn);
             toolbar.add(repeaterBtn);
@@ -1658,12 +1691,7 @@ public class VerbTamper implements BurpExtension {
                     return;
                 }
                 lastSelectedVerbIndex = verbCombo.getSelectedIndex();
-                String text = requestArea.getText();
-                if (text.isEmpty() || text.startsWith("Right-click")) return;
-                String updated = applyVerb(text, selected);
-                int caret = requestArea.getCaretPosition();
-                requestArea.setText(updated);
-                requestArea.setCaretPosition(Math.min(caret, updated.length()));
+                reapplyCurrentVerb();
             });
             sendBtn.addActionListener(e -> doSend());
             scanBtn.addActionListener(e -> {
@@ -2744,16 +2772,33 @@ public class VerbTamper implements BurpExtension {
             return newMethod + raw.substring(firstSpace);
         }
 
+        private void reapplyCurrentVerb() {
+            if (loading || navigating) return;
+            String selected = (String) verbCombo.getSelectedItem();
+            if (selected == null || CUSTOM_VERB_LABEL.equals(selected)) return;
+            String text = requestArea.getText();
+            if (text.isEmpty() || text.startsWith("Right-click")) return;
+            String updated = applyVerb(text, selected);
+            int caret = requestArea.getCaretPosition();
+            requestArea.setText(updated);
+            requestArea.setCaretPosition(Math.min(caret, updated.length()));
+        }
+
         /**
          * Applies a verb the way the user has asked for it: with parameter migration
-         * when the "Migrate params" box is ticked, otherwise a bare method swap that
+         * when the "Migrate params" box is ticked, parameter duplication (both URL & body)
+         * when "Duplicate params" is ticked, otherwise a bare method swap that
          * leaves every other byte alone. Scan All deliberately does not go through
          * here -- see {@link #doScan()}.
          */
         private String applyVerb(String raw, String newMethod) {
-            return migrateParamsChk.isSelected()
-                    ? transformRequestMethod(raw, newMethod)
-                    : swapMethod(raw, newMethod);
+            if (migrateParamsRadio.isSelected()) {
+                return transformRequestMethod(raw, newMethod);
+            } else if (duplicateParamsRadio.isSelected()) {
+                return duplicateParamsRequestMethod(raw, newMethod);
+            } else {
+                return swapMethod(raw, newMethod);
+            }
         }
 
         /**
@@ -2913,6 +2958,162 @@ public class VerbTamper implements BurpExtension {
             sb.append("\r\n");
             if (!bodyPart.isEmpty()) {
                 sb.append(bodyPart);
+            }
+            return sb.toString();
+        }
+
+        /**
+         * Duplicates suitable form parameters (k=v pairs, no whitespace) so that they
+         * appear both in the URL query string and in the request body.
+         * Updates/adds Content-Type and Content-Length headers for the body.
+         */
+        private String duplicateParamsRequestMethod(String raw, String newMethod) {
+            if (raw == null || raw.isEmpty() || raw.startsWith("Right-click")) return raw;
+
+            // Normalize CRLF to \n; strip lone \r
+            String normalised = raw.replace("\r\n", "\n").replace("\r", "");
+            int blank = normalised.indexOf("\n\n");
+            String headerPart;
+            String bodyPart;
+            if (blank == -1) {
+                headerPart = normalised;
+                bodyPart = "";
+            } else {
+                headerPart = normalised.substring(0, blank);
+                bodyPart = normalised.substring(blank + 2);
+            }
+
+            String[] headerLines = headerPart.split("\n", -1);
+            if (headerLines.length == 0 || headerLines[0].trim().isEmpty()) {
+                return raw;
+            }
+
+            String requestLine = headerLines[0];
+            String[] parts = requestLine.split("\\s+");
+            if (parts.length < 2) {
+                return swapMethod(raw, newMethod);
+            }
+
+            String targetPath = parts[1];
+            String httpVersion = parts.length >= 3 ? parts[2] : "HTTP/1.1";
+
+            String pathOnly = targetPath;
+            String queryParams = null;
+            if (targetPath.contains("?")) {
+                int qIdx = targetPath.indexOf('?');
+                pathOnly = targetPath.substring(0, qIdx);
+                queryParams = targetPath.substring(qIdx + 1);
+            }
+
+            String existingBody = bodyPart.trim();
+            boolean queryIsForm = queryParams != null && !queryParams.isEmpty() && formBodyPattern.matcher(queryParams).matches();
+            boolean bodyIsForm = !existingBody.isEmpty() && formBodyPattern.matcher(existingBody).matches();
+
+            // If existing body is non-empty and NOT form data (e.g. JSON, XML), don't corrupt it
+            if (!existingBody.isEmpty() && !bodyIsForm) {
+                return swapMethod(raw, newMethod);
+            }
+
+            // If query params are present but not form-shaped, don't corrupt them
+            if (queryParams != null && !queryParams.isEmpty() && !queryIsForm) {
+                return swapMethod(raw, newMethod);
+            }
+
+            // Determine the duplicated parameter string
+            String finalParams = null;
+            if (queryIsForm && bodyIsForm) {
+                finalParams = mergeParams(queryParams, existingBody);
+            } else if (queryIsForm) {
+                finalParams = queryParams;
+            } else if (bodyIsForm) {
+                finalParams = existingBody;
+            }
+
+            // If no suitable parameters exist in either query or body, fall back to plain method swap
+            if (finalParams == null || finalParams.isEmpty()) {
+                return swapMethod(raw, newMethod);
+            }
+
+            String newFirstLine = newMethod + " " + pathOnly + "?" + finalParams + " " + httpVersion;
+            headerLines[0] = newFirstLine;
+
+            // Update or insert Content-Type: application/x-www-form-urlencoded
+            boolean hasContentType = false;
+            for (int i = 1; i < headerLines.length; i++) {
+                if (headerLines[i].toLowerCase(java.util.Locale.ROOT).startsWith("content-type:")) {
+                    headerLines[i] = "Content-Type: application/x-www-form-urlencoded";
+                    hasContentType = true;
+                    break;
+                }
+            }
+
+            List<String> updatedHeaders = new ArrayList<>();
+            for (int i = 0; i < headerLines.length; i++) {
+                updatedHeaders.add(headerLines[i]);
+            }
+
+            if (!hasContentType) {
+                int insertIdx = -1;
+                for (int i = 1; i < updatedHeaders.size(); i++) {
+                    if (updatedHeaders.get(i).toLowerCase(java.util.Locale.ROOT).startsWith("host:")) {
+                        insertIdx = i + 1;
+                        break;
+                    }
+                }
+                if (insertIdx == -1) insertIdx = updatedHeaders.size();
+                updatedHeaders.add(insertIdx, "Content-Type: application/x-www-form-urlencoded");
+            }
+
+            // Calculate Content-Length in UTF-8 bytes
+            int bodyLen = finalParams.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+            boolean hasContentLength = false;
+            for (int i = 1; i < updatedHeaders.size(); i++) {
+                if (updatedHeaders.get(i).toLowerCase(java.util.Locale.ROOT).startsWith("content-length:")) {
+                    updatedHeaders.set(i, "Content-Length: " + bodyLen);
+                    hasContentLength = true;
+                    break;
+                }
+            }
+            if (!hasContentLength) {
+                updatedHeaders.add("Content-Length: " + bodyLen);
+            }
+
+            StringBuilder sb = new StringBuilder();
+            for (String h : updatedHeaders) {
+                sb.append(h).append("\r\n");
+            }
+            sb.append("\r\n").append(finalParams);
+            return sb.toString();
+        }
+
+        /**
+         * Combines the query-string and body parameter lists into the single list
+         * that gets duplicated into both places.
+         *
+         * Comparison is per-parameter, not by substring. Substring containment gets
+         * this exactly backwards on the case the feature exists to test: with
+         * ?id=10 in the query and id=1 in the body, "id=10".contains("id=1") is
+         * true, so the body parameter would be dropped and the request would go out
+         * un-polluted -- a silent false negative. Same-key-different-value pairs are
+         * the point of HPP, so they must both survive; only an exact duplicate of a
+         * whole k=v pair is collapsed.
+         */
+        private String mergeParams(String queryParams, String bodyParams) {
+            if (queryParams == null || queryParams.isEmpty()) return bodyParams;
+            if (bodyParams == null || bodyParams.isEmpty()) return queryParams;
+
+            List<String> merged = new ArrayList<>();
+            for (String pair : queryParams.split("&")) {
+                if (!pair.isEmpty() && !merged.contains(pair)) merged.add(pair);
+            }
+            for (String pair : bodyParams.split("&")) {
+                if (!pair.isEmpty() && !merged.contains(pair)) merged.add(pair);
+            }
+
+            StringBuilder sb = new StringBuilder();
+            for (String pair : merged) {
+                if (sb.length() > 0) sb.append('&');
+                sb.append(pair);
             }
             return sb.toString();
         }
