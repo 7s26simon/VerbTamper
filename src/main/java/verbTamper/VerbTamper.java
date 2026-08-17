@@ -1455,8 +1455,9 @@ public class VerbTamper implements BurpExtension {
         private final JButton copyRespBtn;
         private final JButton diffBtn;
         private final JButton followRedirectBtn;
-        private final JCheckBox migrateParamsChk;
-        private final JCheckBox duplicateParamsChk;
+        private final JRadioButton migrateParamsRadio;
+        private final JRadioButton duplicateParamsRadio;
+        private final JRadioButton leaveParamsRadio;
         private final JLabel statusLabel;
         private final JLabel historyLabel;
 
@@ -1581,38 +1582,42 @@ public class VerbTamper implements BurpExtension {
             copyRespBtn = new JButton("Copy Resp");
             copyRespBtn.setEnabled(false);
 
-            migrateParamsChk = new JCheckBox("Migrate params", true);
-            migrateParamsChk.setToolTipText("<html>When the verb changes, move parameters between the query string "
-                    + "and a form body:<br>GET <code>?a=1</code> &rarr; POST body, and back again.<br>"
-                    + "Applies to the editor, Send and Send to Repeater. "
-                    + "<b>Scan All Verbs always sends byte-identical requests</b> regardless of this setting.</html>");
+            // Migrate / Duplicate / Leave alone are three mutually exclusive states,
+            // so they're a radio group rather than checkboxes that disable each
+            // other -- with two checkboxes, the default (Migrate ticked) leaves
+            // Duplicate greyed out, and reaching it takes two clicks through a
+            // state nobody wants to stop at.
+            String scanNote = "<br>Applies to the editor, Send and Send to Repeater. "
+                    + "<b>Scan All Verbs always sends byte-identical requests</b> regardless of this setting.</html>";
 
-            duplicateParamsChk = new JCheckBox("Duplicate params", false);
-            duplicateParamsChk.setEnabled(false);
-            duplicateParamsChk.setToolTipText("<html>When suitable parameters exist (form data k=v pairs), include them "
-                    + "both in the URL query string and in the request body.<br>"
-                    + "Applies to the editor, Send and Send to Repeater. "
-                    + "<b>Scan All Verbs always sends byte-identical requests</b> regardless of this setting.</html>");
+            migrateParamsRadio = new JRadioButton("Migrate", true);
+            migrateParamsRadio.setToolTipText("<html>When the verb changes, move parameters between the query string "
+                    + "and a form body:<br>GET <code>?a=1</code> &rarr; POST body, and back again." + scanNote);
 
-            migrateParamsChk.addActionListener(e -> {
-                if (migrateParamsChk.isSelected()) {
-                    duplicateParamsChk.setSelected(false);
-                    duplicateParamsChk.setEnabled(false);
-                } else {
-                    duplicateParamsChk.setEnabled(true);
-                }
-                reapplyCurrentVerb();
-            });
+            duplicateParamsRadio = new JRadioButton("Duplicate", false);
+            duplicateParamsRadio.setToolTipText("<html>Copy form parameters (<code>k=v</code> pairs) into <i>both</i> the "
+                    + "query string and the body, for HPP / parser-differential testing.<br>"
+                    + "Same-key-different-value pairs are both kept." + scanNote);
 
-            duplicateParamsChk.addActionListener(e -> {
-                if (duplicateParamsChk.isSelected()) {
-                    migrateParamsChk.setSelected(false);
-                    migrateParamsChk.setEnabled(false);
-                } else {
-                    migrateParamsChk.setEnabled(true);
-                }
-                reapplyCurrentVerb();
-            });
+            leaveParamsRadio = new JRadioButton("Leave", false);
+            leaveParamsRadio.setToolTipText("<html>Bare method swap: change the verb and nothing else, "
+                    + "leaving parameters, headers and body byte-for-byte as they are." + scanNote);
+
+            ButtonGroup paramsGroup = new ButtonGroup();
+            paramsGroup.add(migrateParamsRadio);
+            paramsGroup.add(duplicateParamsRadio);
+            paramsGroup.add(leaveParamsRadio);
+
+            ActionListener paramsModeListener = e -> reapplyCurrentVerb();
+            migrateParamsRadio.addActionListener(paramsModeListener);
+            duplicateParamsRadio.addActionListener(paramsModeListener);
+            leaveParamsRadio.addActionListener(paramsModeListener);
+
+            JPanel paramsModePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 0));
+            paramsModePanel.add(new JLabel("Params:"));
+            paramsModePanel.add(migrateParamsRadio);
+            paramsModePanel.add(duplicateParamsRadio);
+            paramsModePanel.add(leaveParamsRadio);
 
             statusLabel = new JLabel(" ");
             statusLabel.setForeground(Color.GRAY);
@@ -1624,8 +1629,7 @@ public class VerbTamper implements BurpExtension {
             toolbar.add(makeSep());
             toolbar.add(new JLabel("Verb:"));
             toolbar.add(verbCombo);
-            toolbar.add(migrateParamsChk);
-            toolbar.add(duplicateParamsChk);
+            toolbar.add(paramsModePanel);
             toolbar.add(sendBtn);
             toolbar.add(scanBtn);
             toolbar.add(repeaterBtn);
@@ -1687,12 +1691,7 @@ public class VerbTamper implements BurpExtension {
                     return;
                 }
                 lastSelectedVerbIndex = verbCombo.getSelectedIndex();
-                String text = requestArea.getText();
-                if (text.isEmpty() || text.startsWith("Right-click")) return;
-                String updated = applyVerb(text, selected);
-                int caret = requestArea.getCaretPosition();
-                requestArea.setText(updated);
-                requestArea.setCaretPosition(Math.min(caret, updated.length()));
+                reapplyCurrentVerb();
             });
             sendBtn.addActionListener(e -> doSend());
             scanBtn.addActionListener(e -> {
@@ -2793,9 +2792,9 @@ public class VerbTamper implements BurpExtension {
          * here -- see {@link #doScan()}.
          */
         private String applyVerb(String raw, String newMethod) {
-            if (migrateParamsChk.isSelected()) {
+            if (migrateParamsRadio.isSelected()) {
                 return transformRequestMethod(raw, newMethod);
-            } else if (duplicateParamsChk.isSelected()) {
+            } else if (duplicateParamsRadio.isSelected()) {
                 return duplicateParamsRequestMethod(raw, newMethod);
             } else {
                 return swapMethod(raw, newMethod);
@@ -3087,13 +3086,36 @@ public class VerbTamper implements BurpExtension {
             return sb.toString();
         }
 
+        /**
+         * Combines the query-string and body parameter lists into the single list
+         * that gets duplicated into both places.
+         *
+         * Comparison is per-parameter, not by substring. Substring containment gets
+         * this exactly backwards on the case the feature exists to test: with
+         * ?id=10 in the query and id=1 in the body, "id=10".contains("id=1") is
+         * true, so the body parameter would be dropped and the request would go out
+         * un-polluted -- a silent false negative. Same-key-different-value pairs are
+         * the point of HPP, so they must both survive; only an exact duplicate of a
+         * whole k=v pair is collapsed.
+         */
         private String mergeParams(String queryParams, String bodyParams) {
             if (queryParams == null || queryParams.isEmpty()) return bodyParams;
             if (bodyParams == null || bodyParams.isEmpty()) return queryParams;
-            if (queryParams.equals(bodyParams)) return queryParams;
-            if (queryParams.contains(bodyParams)) return queryParams;
-            if (bodyParams.contains(queryParams)) return bodyParams;
-            return queryParams + "&" + bodyParams;
+
+            List<String> merged = new ArrayList<>();
+            for (String pair : queryParams.split("&")) {
+                if (!pair.isEmpty() && !merged.contains(pair)) merged.add(pair);
+            }
+            for (String pair : bodyParams.split("&")) {
+                if (!pair.isEmpty() && !merged.contains(pair)) merged.add(pair);
+            }
+
+            StringBuilder sb = new StringBuilder();
+            for (String pair : merged) {
+                if (sb.length() > 0) sb.append('&');
+                sb.append(pair);
+            }
+            return sb.toString();
         }
 
         /** Builds the initial list of items for the verb dropdown: the seven
