@@ -125,7 +125,7 @@ public class VerbTamper implements BurpExtension {
 
         api.userInterface().registerContextMenuItemsProvider(new VerbContextMenuProvider());
         this.tabRegistration = api.userInterface().registerSuiteTab("Verb Tamper", suiteTabs);
-        api.logging().logToOutput("Verb Tamper 2.2.0 loaded.");
+        api.logging().logToOutput("Verb Tamper 2.3.0 loaded.");
     }
 
     /**

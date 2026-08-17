@@ -80,11 +80,11 @@ Send any request to VerbTamper, change the verb or inject a bypass header, and f
 
 ### Steps
 
-1. Download `VerbTamper-2.2.0.jar` from [Releases](../../releases)
+1. Download `VerbTamper-2.3.0.jar` from [Releases](../../releases)
 2. In Burp Suite, go to **Extensions → Installed → Add**
 3. Set **Extension type** to `Java`
 4. Select the downloaded `.jar` file
-5. Click **Next** — you should see `Verb Tamper 2.2.0 loaded.` in the output
+5. Click **Next** — you should see `Verb Tamper 2.3.0 loaded.` in the output
 6. A **Verb Tamper** tab will appear in the main Burp window
 
 ---
@@ -229,7 +229,7 @@ python3 scripts/extract-local-montoya.py
 # Build
 gradle jar
 
-# Output: build/libs/VerbTamper-2.2.0.jar
+# Output: build/libs/VerbTamper-2.3.0.jar
 ```
 
 > **Why not Maven Central?** The Montoya API jar on Maven Central may not match the exact version bundled with your Burp installation, causing `NoSuchMethodError` at runtime. Extracting directly from your Burp jar guarantees compatibility.
